@@ -35,6 +35,9 @@ pub const matmul = @import("kernels/matmul.zig");
 pub const rmsnorm = @import("kernels/rmsnorm.zig");
 pub const softmax = @import("kernels/softmax.zig");
 pub const silu = @import("kernels/silu.zig");
+pub const rope = @import("kernels/rope.zig");
+pub const attention = @import("kernels/attention.zig");
+pub const forward = @import("forward.zig");
 
 // ============================================================================
 // Re-export tests — pulls tests from every submodule by referencing them.
@@ -46,4 +49,7 @@ comptime {
     _ = rmsnorm;
     _ = softmax;
     _ = silu;
+    _ = rope;
+    _ = attention;
+    _ = forward;
 }
