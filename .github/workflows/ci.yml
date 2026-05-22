@@ -1,0 +1,39 @@
+# Note: requires SMC17/safetensors-zig and SMC17/tokenizers-zig to be
+# public for CI to pass. Both repos are currently private with sovereign
+# mirror stubs; this workflow is staged so it's ready when they go public.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vllm-zig
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: SMC17/safetensors-zig
+          path: safetensors-zig
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: SMC17/tokenizers-zig
+          path: tokenizers-zig
+          fetch-depth: 1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: zig version
+        run: zig version
+      - name: zig build test
+        working-directory: vllm-zig
+        # Integration example examples/infer_tinyllama.zig needs a 2.2GB
+        # safetensors fixture and is NOT exercised here. test step only.
+        run: zig build test --summary all
