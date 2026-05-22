@@ -36,6 +36,29 @@ shape. Modest 1.19x vs single-thread is expected — at M=1 with a 16 MB
 B matrix the bottleneck is memory bandwidth shared across the 8 cores,
 not compute.
 
+### End-to-end on TinyLlama-1.1B-Chat (8-core consumer Linux, ReleaseFast)
+
+Real inference path, prompt "The capital of France is", max_new=8:
+
+```
+  metric          | (A) no pool | (B) pool    | speedup
+  ----------------+-------------+-------------+--------
+  first-token ms  |        3937 |        3285 | 1.20x
+  total ms        |        9686 |        7352 | 1.32x
+  decode ms/tok   |         821 |         581 | 1.41x
+```
+
+Pool path delivers **1.41x decode improvement** end-to-end. The
+synthetic 2.47x at the matmul level dilutes to 1.41x at the
+forward-pass level because matmul is ~70-80% of forward-pass wall
+time (the rest is RMSNorm, attention KV gather, softmax, RoPE,
+residuals).
+
+Compared to v0.0.3's baseline (608 ms/tok), v0.0.5 at 581 ms/tok is
+4.5% faster — closing the v0.0.4 regression AND beating v0.0.3.
+
+Bench harness: `zig build bench-tinyllama-pool`.
+
 ### Test count
 
 69 tests pass (+11 from v0.0.4):

@@ -92,4 +92,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_infer.addArgs(args);
     const infer_step = b.step("infer-tinyllama", "End-to-end TinyLlama inference smoke test");
     infer_step.dependOn(&run_infer.step);
+
+    // End-to-end TinyLlama pool-vs-no-pool head-to-head bench
+    const bench_tll_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_tinyllama_pool.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_tll_mod.addImport("vllm", mod);
+    bench_tll_mod.addImport("safetensors", safetensors_dep.module("safetensors"));
+    bench_tll_mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
+    const bench_tll_exe = b.addExecutable(.{
+        .name = "bench-tinyllama-pool",
+        .root_module = bench_tll_mod,
+    });
+    const run_bench_tll = b.addRunArtifact(bench_tll_exe);
+    if (b.args) |args| run_bench_tll.addArgs(args);
+    run_bench_tll.has_side_effects = true;
+    const bench_tll_step = b.step("bench-tinyllama-pool", "TinyLlama end-to-end pool vs no-pool head-to-head");
+    bench_tll_step.dependOn(&run_bench_tll.step);
 }

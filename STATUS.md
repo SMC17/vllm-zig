@@ -29,6 +29,18 @@ Pool is **2.47x faster than v0.0.4** at decode. Modest 1.19x over
 single-thread is expected: 8 threads sharing the memory bus to a
 16 MB B matrix is memory-bandwidth bound, not compute bound.
 
+### End-to-end TinyLlama-1.1B (prompt "The capital of France is", max_new=8)
+
+| Metric | (A) no pool | (B) pool | Speedup |
+|---|---|---|---|
+| first-token ms | 3937 | 3285 | 1.20x |
+| total ms | 9686 | 7352 | 1.32x |
+| **decode ms/tok** | **821** | **581** | **1.41x** |
+
+v0.0.5 at 581 ms/tok beats v0.0.3's 608 ms/tok baseline (4.5% faster),
+fully closing the v0.0.4 regression. Pool path is **1.41x faster than
+v0.0.4 ad-hoc spawn** end-to-end. Bench: `zig build bench-tinyllama-pool`.
+
 ### What's still open for v0.0.6+
 
 - Cache-tiled GEMM (per ARCHITECTURE.md): N=1024 GFLOPS drops to 4.4
