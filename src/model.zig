@@ -27,6 +27,7 @@ const attention = @import("kernels/attention.zig");
 const silu = @import("kernels/silu.zig");
 const weights_mod = @import("weights.zig");
 const kv_cache_mod = @import("kv_cache.zig");
+const thread_pool = @import("thread_pool.zig");
 
 pub const Config = struct {
     vocab_size: usize,
@@ -130,10 +131,31 @@ pub const Model = struct {
     rope_cache: rope.RopeCache,
     /// Number of threads used by multi-thread kernels. 0 = single-thread.
     n_threads: usize = 0,
+    /// Optional persistent thread pool. When set, forward() routes matmul
+    /// calls through thread_pool.Pool.matmulAuto, eliminating the per-call
+    /// spawn overhead that dominated decode in v0.0.4 (~30-100us spawn
+    /// per worker × ~110 matmul calls/token). The Model does not own
+    /// the pool — caller is responsible for init/deinit. Lifetime must
+    /// outlast all forward() calls.
+    pool: ?*thread_pool.Pool = null,
 
     /// Configure the matmul thread count for subsequent forward passes.
     pub fn setThreads(self: *Model, n: usize) void {
         self.n_threads = n;
+    }
+
+    /// Attach a persistent thread pool. Caller retains ownership; the pool
+    /// must outlive every subsequent forward() call. n_threads should match
+    /// the pool's worker count for best behavior.
+    pub fn setThreadPool(self: *Model, pool: *thread_pool.Pool) void {
+        self.pool = pool;
+    }
+
+    inline fn matmulDispatch(self: *const Model, a: *const Matrix, b: *const Matrix, c: *Matrix) !void {
+        if (self.pool) |p| {
+            return p.matmulAuto(a, b, c, self.n_threads);
+        }
+        return matmul.matmulSIMDAuto(a, b, c, self.n_threads);
     }
 
     pub fn deinit(self: *Model) void {
@@ -249,15 +271,15 @@ pub const Model = struct {
             // QKV projections
             var q = try Matrix.init(alloc, seq, q_dim);
             defer q.deinit(alloc);
-            try matmul.matmulSIMDAuto(&x, &layer.w_q, &q, self.n_threads);
+            try self.matmulDispatch(&x, &layer.w_q, &q);
 
             var k = try Matrix.init(alloc, seq, kv_dim);
             defer k.deinit(alloc);
-            try matmul.matmulSIMDAuto(&x, &layer.w_k, &k, self.n_threads);
+            try self.matmulDispatch(&x, &layer.w_k, &k);
 
             var v = try Matrix.init(alloc, seq, kv_dim);
             defer v.deinit(alloc);
-            try matmul.matmulSIMDAuto(&x, &layer.w_v, &v, self.n_threads);
+            try self.matmulDispatch(&x, &layer.w_v, &v);
 
             // RoPE on Q and K
             try self.rope_cache.applyToSequence(q.data, seq, cfg.num_attention_heads, start_pos);
@@ -291,7 +313,7 @@ pub const Model = struct {
             // O projection
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer o_out.deinit(alloc);
-            try matmul.matmulSIMDAuto(&attn_out, &layer.w_o, &o_out, self.n_threads);
+            try self.matmulDispatch(&attn_out, &layer.w_o, &o_out);
 
             // Residual add
             for (x.data, residual.data, o_out.data) |*xv, rv, ov| xv.* = rv + ov;
@@ -305,17 +327,17 @@ pub const Model = struct {
             // MLP
             var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer gate.deinit(alloc);
-            try matmul.matmulSIMDAuto(&x, &layer.w_gate, &gate, self.n_threads);
+            try self.matmulDispatch(&x, &layer.w_gate, &gate);
 
             var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer up.deinit(alloc);
-            try matmul.matmulSIMDAuto(&x, &layer.w_up, &up, self.n_threads);
+            try self.matmulDispatch(&x, &layer.w_up, &up);
 
             try silu.siluMul(gate.data, up.data);
 
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
-            try matmul.matmulSIMDAuto(&gate, &layer.w_down, &down_out, self.n_threads);
+            try self.matmulDispatch(&gate, &layer.w_down, &down_out);
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;
         }
@@ -331,7 +353,7 @@ pub const Model = struct {
 
         var logits_m = try Matrix.init(alloc, 1, cfg.vocab_size);
         defer logits_m.deinit(alloc);
-        try matmul.matmulSIMDAuto(&x_last, &self.lm_head, &logits_m, self.n_threads);
+        try self.matmulDispatch(&x_last, &self.lm_head, &logits_m);
 
         const logits = try alloc.alloc(f32, cfg.vocab_size);
         @memcpy(logits, logits_m.row(0));

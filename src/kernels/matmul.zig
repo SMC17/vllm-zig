@@ -114,6 +114,10 @@ pub fn matmulSIMDAuto(a: *const Matrix, b: *const Matrix, c: *Matrix, n_threads:
     }
 }
 
+// Persistent thread pool variants moved to src/thread_pool.zig — they need
+// raw Linux futex syscalls since Zig 0.16 dropped std.Thread.Pool. See
+// thread_pool.zig for the Pool type and its matmul* methods.
+
 /// Column-split multi-thread matmul: each thread handles a contiguous
 /// slice of N (output columns) instead of M (output rows). Used when
 /// M is too small to row-split (decode: M=seq=1).

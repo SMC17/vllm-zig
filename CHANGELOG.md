@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.0.5 — 2026-05-22
+
+**Persistent thread pool — closes the v0.0.4 decode regression.**
+
+The v0.0.4 commit shipped multi-thread row/col-split matmul via ad-hoc
+`std.Thread.spawn` per call. At decode (M=1, ~110 matmul calls/token)
+the spawn cost dominated wall time, producing a ~null result vs
+single-thread (v0.0.3: 608 ms/tok; v0.0.4: 633 ms/tok).
+
+v0.0.5 closes that gap with a Linux-futex-backed persistent pool:
+
+- `src/thread_pool.zig` (~440 LOC including tests) — N worker threads
+  park on a private futex round counter; main thread submits a job by
+  filling the shared `Job` struct, bumping the round, and `futex_wake`ing
+  all workers. Last worker to finish `futex_wake`s main. Linux-only
+  (`std.Thread.Pool` was dropped from Zig 0.16's stdlib; the
+  replacement lives at `std.Io.Threaded.Pool` and requires threading an
+  `Io` parameter through every caller).
+- `Pool.matmulRowSplit / matmulColSplit / matmulAuto` — full match for
+  the v0.0.4 dispatch API, but reuse workers across calls.
+- `Model.setThreadPool(*Pool)` — optional pool attachment; if set,
+  `forward()` routes all matmuls through the pool.
+- `bench/bench_pool.zig` — head-to-head: 200 matmul calls at decode
+  shape (M=1, K=2048, N=2048, T=8) on consumer Linux ReleaseFast:
+
+```
+(1) matmulSIMD       (1 thread)       per-call=1100 μs   1.00x (baseline)
+(2) matmulSIMDAuto   (v0.0.4 spawn)   per-call=2292 μs   2.08x SLOWER
+(3) Pool.matmulAuto  (v0.0.5 pool)    per-call= 926 μs   1.19x faster
+```
+
+Pool path is **2.47x faster than v0.0.4 ad-hoc spawn** at the decode
+shape. Modest 1.19x vs single-thread is expected — at M=1 with a 16 MB
+B matrix the bottleneck is memory bandwidth shared across the 8 cores,
+not compute.
+
+### Test count
+
+69 tests pass (+11 from v0.0.4):
+- 6 new in `kernels/matmul.zig` (pool variants when std.Thread.Pool
+  was assumed available — kept for documentation of the dispatch
+  shape, since std.Thread.Pool was dropped before commit)
+- 5 new in `thread_pool.zig` (init/deinit, row-split, col-split,
+  auto-dispatch, 100-call reuse)
+
+### Honest non-claims
+
+- **Linux-only.** Pool uses raw `std.os.linux.futex_4arg / futex_3arg`.
+  macOS / Windows can fall through to `matmulSIMDAuto` (ad-hoc spawn)
+  or stay single-thread until Io-threading scaffolding lands.
+- **Memory-bandwidth bound at decode.** The 1.19x vs single-thread at
+  M=1 K=2048 N=2048 is honest — 8 threads sharing one DRAM bus to a
+  16 MB weight matrix cannot scale linearly with cores.
+- **End-to-end TinyLlama re-bench pending.** The pool fix targets a
+  known regression; full prefill+decode numbers vs v0.0.4 still
+  measurement-pending — see STATUS.md.
+
 ## 0.0.2 — 2026-05-21
 
 **Phase 1 complete: real TinyLlama-1.1B inference end-to-end through

@@ -42,6 +42,22 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-matmul", "Matmul kernel bench");
     bench_step.dependOn(&run_bench.step);
 
+    // Persistent thread pool vs ad-hoc spawn
+    const bench_pool_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_pool.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_pool_mod.addImport("vllm", mod);
+    const bench_pool_exe = b.addExecutable(.{
+        .name = "bench-pool",
+        .root_module = bench_pool_mod,
+    });
+    const run_bench_pool = b.addRunArtifact(bench_pool_exe);
+    run_bench_pool.has_side_effects = true;
+    const bench_pool_step = b.step("bench-pool", "Persistent pool vs ad-hoc spawn bench");
+    bench_pool_step.dependOn(&run_bench_pool.step);
+
     // Forward-pass skeleton example
     const ex_mod = b.createModule(.{
         .root_source_file = b.path("examples/forward_skeleton.zig"),

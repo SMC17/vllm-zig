@@ -1,7 +1,49 @@
 # STATUS
 
-**Version:** v0.0.2 (Phase 1 complete — real TinyLlama inference)
-**Last update:** 2026-05-21
+**Version:** v0.0.5 (persistent thread pool — decode regression closed)
+**Last update:** 2026-05-22
+
+## What landed in v0.0.5 (on top of v0.0.4)
+
+- `src/thread_pool.zig`: Linux-futex-backed persistent thread pool
+  (~440 LOC). N workers park on a private futex round counter; main
+  submits via a shared `Job` struct + `round.fetchAdd` + `futex_wake`
+  broadcast; workers signal done via `n_pending.fetchSub` + `futex_wake`
+  back to main. No per-call spawn cost.
+- `Pool.matmulRowSplit / matmulColSplit / matmulAuto` — same dispatch
+  shape as v0.0.4 (auto-row when M≥T, auto-col when M<T) but workers
+  are persistent.
+- `Model.setThreadPool(*Pool)` — optional attachment; `forward()`
+  routes through `pool.matmulAuto` when set.
+- `bench/bench_pool.zig` — head-to-head at decode shape.
+
+### Bench at decode shape (M=1, K=2048, N=2048, T=8, ReleaseFast)
+
+| Path | per-call | vs single-thread |
+|---|---|---|
+| matmulSIMD (1 thread) | 1100 μs | 1.00x (baseline) |
+| matmulSIMDAuto (v0.0.4 spawn) | 2292 μs | **2.08x slower** |
+| Pool.matmulAuto (v0.0.5 pool) | **926 μs** | **1.19x faster** |
+
+Pool is **2.47x faster than v0.0.4** at decode. Modest 1.19x over
+single-thread is expected: 8 threads sharing the memory bus to a
+16 MB B matrix is memory-bandwidth bound, not compute bound.
+
+### What's still open for v0.0.6+
+
+- Cache-tiled GEMM (per ARCHITECTURE.md): N=1024 GFLOPS drops to 4.4
+  because working set blasts L2/L3. Blocked matmul recovers that.
+- BF16 storage end-to-end + mixed-precision compute (halves memory
+  footprint → less bandwidth pressure → better multi-thread scaling)
+- PagedAttention KV cache (Phase 1.5)
+- macOS / Windows pool path (Io-threading refactor, or platform-
+  specific futex equivalents)
+
+## Phase position
+
+Per `ARCHITECTURE.md` §13:
+
+- Phase 0 (design doc) — done 2026-05-20
 
 ## Phase position
 
@@ -10,7 +52,10 @@ Per `ARCHITECTURE.md` §13:
 - Phase 0 (design doc) — done 2026-05-20
 - Phase 1 prelude (CPU kernel substrate) — done 2026-05-21
 - Phase 1 proper (RoPE + GQA attention + forward block) — done 2026-05-21
-- **Phase 1 complete (multi-block real TinyLlama inference) — DONE 2026-05-21** ← here
+- Phase 1 complete (multi-block real TinyLlama inference) — done 2026-05-21
+- **v0.0.3 streaming + multi-thread + parallel BF16 load — done 2026-05-21**
+- **v0.0.4 N-axis col-split matmul + auto-dispatch — done 2026-05-22**
+- **v0.0.5 persistent thread pool — done 2026-05-22** ← here
 - Phase 1.5 (PagedAttention + KV cache improvements) — not started
 - Phase 2 (continuous batching + HTTP front-end) — not started
 - Phase 3 (LiveView + public v0.1 release) — not started

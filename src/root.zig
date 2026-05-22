@@ -43,6 +43,8 @@ pub const weights = @import("weights.zig");
 pub const kv_cache = @import("kv_cache.zig");
 pub const sampler = @import("sampler.zig");
 pub const model = @import("model.zig");
+pub const thread_pool = @import("thread_pool.zig");
+pub const Pool = thread_pool.Pool;
 
 // ============================================================================
 // Re-export tests — pulls tests from every submodule by referencing them.
@@ -62,4 +64,5 @@ comptime {
     _ = kv_cache;
     _ = sampler;
     _ = model;
+    _ = thread_pool;
 }
