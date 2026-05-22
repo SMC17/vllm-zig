@@ -38,6 +38,11 @@ pub const silu = @import("kernels/silu.zig");
 pub const rope = @import("kernels/rope.zig");
 pub const attention = @import("kernels/attention.zig");
 pub const forward = @import("forward.zig");
+pub const bf16 = @import("bf16.zig");
+pub const weights = @import("weights.zig");
+pub const kv_cache = @import("kv_cache.zig");
+pub const sampler = @import("sampler.zig");
+pub const model = @import("model.zig");
 
 // ============================================================================
 // Re-export tests — pulls tests from every submodule by referencing them.
@@ -52,4 +57,9 @@ comptime {
     _ = rope;
     _ = attention;
     _ = forward;
+    _ = bf16;
+    _ = weights;
+    _ = kv_cache;
+    _ = sampler;
+    _ = model;
 }

@@ -16,5 +16,12 @@
         "ARCHITECTURE.md",
         "LICENSE",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        .safetensors = .{
+            .path = "../safetensors-zig",
+        },
+        .tokenizers = .{
+            .path = "../tokenizers-zig",
+        },
+    },
 }
