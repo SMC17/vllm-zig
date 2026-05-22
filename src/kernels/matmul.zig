@@ -100,6 +100,90 @@ pub fn matmulSIMDMulti(a: *const Matrix, b: *const Matrix, c: *Matrix, n_threads
     while (t < T) : (t += 1) threads_buf[t].join();
 }
 
+/// Smart multi-thread matmul: chooses row-split when M >= n_threads,
+/// col-split when M < n_threads (typical for decode where M = seq = 1).
+/// This is the v0.0.4 fix for the M=1 fall-through that prevented
+/// multi-thread parallelism at decode in v0.0.3.
+pub fn matmulSIMDAuto(a: *const Matrix, b: *const Matrix, c: *Matrix, n_threads: usize) Error!void {
+    if (n_threads <= 1) return matmulSIMD(a, b, c);
+    const M = a.rows;
+    if (M >= n_threads) {
+        return matmulSIMDMulti(a, b, c, n_threads);
+    } else {
+        return matmulSIMDColSplit(a, b, c, n_threads);
+    }
+}
+
+/// Column-split multi-thread matmul: each thread handles a contiguous
+/// slice of N (output columns) instead of M (output rows). Used when
+/// M is too small to row-split (decode: M=seq=1).
+pub fn matmulSIMDColSplit(a: *const Matrix, b: *const Matrix, c: *Matrix, n_threads: usize) Error!void {
+    if (a.cols != b.rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b.cols) return Error.DimensionMismatch;
+    if (n_threads <= 1) return matmulSIMD(a, b, c);
+
+    @memset(c.data, 0.0);
+    const N = b.cols;
+    const T = @min(n_threads, N);
+    if (T <= 1 or T > 16) return matmulSIMD(a, b, c);
+    const chunk = (N + T - 1) / T;
+
+    const Args = struct {
+        a: *const Matrix,
+        b: *const Matrix,
+        c: *Matrix,
+        col_start: usize,
+        col_end: usize,
+    };
+
+    var threads_buf: [16]std.Thread = undefined;
+    var args_buf: [16]Args = undefined;
+
+    var t: usize = 0;
+    while (t < T) : (t += 1) {
+        const start = t * chunk;
+        const end = @min(start + chunk, N);
+        args_buf[t] = .{ .a = a, .b = b, .c = c, .col_start = start, .col_end = end };
+        threads_buf[t] = std.Thread.spawn(.{}, struct {
+            fn run(arg: *Args) void {
+                matmulSIMDColRange(arg.a, arg.b, arg.c, arg.col_start, arg.col_end) catch unreachable;
+            }
+        }.run, .{&args_buf[t]}) catch return Error.DimensionMismatch;
+    }
+    t = 0;
+    while (t < T) : (t += 1) threads_buf[t].join();
+}
+
+fn matmulSIMDColRange(a: *const Matrix, b: *const Matrix, c: *Matrix, col_start: usize, col_end: usize) Error!void {
+    const M = a.rows;
+    const N = b.cols;
+    const K = a.cols;
+    const Vec = @Vector(8, f32);
+    const LANE = 8;
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            const a_scalar: Vec = @splat(a_row[k]);
+            const b_row = b.data[k * N ..][0..N];
+
+            var j = col_start;
+            const aligned_end = col_start + ((col_end - col_start) / LANE) * LANE;
+            while (j < aligned_end) : (j += LANE) {
+                const bv: Vec = b_row[j..][0..LANE].*;
+                const cv: Vec = c_row[j..][0..LANE].*;
+                c_row[j..][0..LANE].* = cv + a_scalar * bv;
+            }
+            while (j < col_end) : (j += 1) {
+                c_row[j] += a_row[k] * b_row[j];
+            }
+        }
+    }
+}
+
 /// Per-thread worker: matmulSIMD over a slice of A's rows [row_start, row_end).
 fn matmulSIMDRows(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: usize, row_end: usize) Error!void {
     const N = b.cols;

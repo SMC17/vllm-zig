@@ -249,15 +249,15 @@ pub const Model = struct {
             // QKV projections
             var q = try Matrix.init(alloc, seq, q_dim);
             defer q.deinit(alloc);
-            try matmul.matmulSIMDMulti(&x, &layer.w_q, &q, self.n_threads);
+            try matmul.matmulSIMDAuto(&x, &layer.w_q, &q, self.n_threads);
 
             var k = try Matrix.init(alloc, seq, kv_dim);
             defer k.deinit(alloc);
-            try matmul.matmulSIMDMulti(&x, &layer.w_k, &k, self.n_threads);
+            try matmul.matmulSIMDAuto(&x, &layer.w_k, &k, self.n_threads);
 
             var v = try Matrix.init(alloc, seq, kv_dim);
             defer v.deinit(alloc);
-            try matmul.matmulSIMDMulti(&x, &layer.w_v, &v, self.n_threads);
+            try matmul.matmulSIMDAuto(&x, &layer.w_v, &v, self.n_threads);
 
             // RoPE on Q and K
             try self.rope_cache.applyToSequence(q.data, seq, cfg.num_attention_heads, start_pos);
@@ -291,7 +291,7 @@ pub const Model = struct {
             // O projection
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer o_out.deinit(alloc);
-            try matmul.matmulSIMDMulti(&attn_out, &layer.w_o, &o_out, self.n_threads);
+            try matmul.matmulSIMDAuto(&attn_out, &layer.w_o, &o_out, self.n_threads);
 
             // Residual add
             for (x.data, residual.data, o_out.data) |*xv, rv, ov| xv.* = rv + ov;
@@ -305,17 +305,17 @@ pub const Model = struct {
             // MLP
             var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer gate.deinit(alloc);
-            try matmul.matmulSIMDMulti(&x, &layer.w_gate, &gate, self.n_threads);
+            try matmul.matmulSIMDAuto(&x, &layer.w_gate, &gate, self.n_threads);
 
             var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer up.deinit(alloc);
-            try matmul.matmulSIMDMulti(&x, &layer.w_up, &up, self.n_threads);
+            try matmul.matmulSIMDAuto(&x, &layer.w_up, &up, self.n_threads);
 
             try silu.siluMul(gate.data, up.data);
 
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
-            try matmul.matmulSIMDMulti(&gate, &layer.w_down, &down_out, self.n_threads);
+            try matmul.matmulSIMDAuto(&gate, &layer.w_down, &down_out, self.n_threads);
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;
         }
@@ -331,7 +331,7 @@ pub const Model = struct {
 
         var logits_m = try Matrix.init(alloc, 1, cfg.vocab_size);
         defer logits_m.deinit(alloc);
-        try matmul.matmulSIMDMulti(&x_last, &self.lm_head, &logits_m, self.n_threads);
+        try matmul.matmulSIMDAuto(&x_last, &self.lm_head, &logits_m, self.n_threads);
 
         const logits = try alloc.alloc(f32, cfg.vocab_size);
         @memcpy(logits, logits_m.row(0));
