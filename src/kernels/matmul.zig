@@ -50,6 +50,87 @@ pub fn matmulScalar(a: *const Matrix, b: *const Matrix, c: *Matrix) Error!void {
     }
 }
 
+/// Multi-thread SIMD matmul. Each thread processes a contiguous chunk
+/// of A's rows (and the corresponding chunk of C's rows). Inner loop
+/// uses the same outer-product SIMD pattern as matmulSIMD.
+///
+/// For N threads, M rows split into N chunks of ceil(M/N) each.
+/// T=1 falls through to single-thread matmulSIMD to avoid spawn overhead.
+pub fn matmulSIMDMulti(a: *const Matrix, b: *const Matrix, c: *Matrix, n_threads: usize) Error!void {
+    if (a.cols != b.rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b.cols) return Error.DimensionMismatch;
+    const M = a.rows;
+    if (n_threads <= 1 or M <= 1) return matmulSIMD(a, b, c);
+
+    @memset(c.data, 0.0);
+
+    const T = @min(n_threads, M);
+    const chunk = (M + T - 1) / T;
+
+    const Args = struct {
+        a: *const Matrix,
+        b: *const Matrix,
+        c: *Matrix,
+        row_start: usize,
+        row_end: usize,
+    };
+
+    var threads_buf: [16]std.Thread = undefined;
+    var args_buf: [16]Args = undefined;
+    if (T > threads_buf.len) return matmulSIMD(a, b, c);
+
+    var t: usize = 0;
+    while (t < T) : (t += 1) {
+        const start = t * chunk;
+        const end = @min(start + chunk, M);
+        args_buf[t] = .{
+            .a = a,
+            .b = b,
+            .c = c,
+            .row_start = start,
+            .row_end = end,
+        };
+        threads_buf[t] = std.Thread.spawn(.{}, struct {
+            fn run(arg: *Args) void {
+                matmulSIMDRows(arg.a, arg.b, arg.c, arg.row_start, arg.row_end) catch unreachable;
+            }
+        }.run, .{&args_buf[t]}) catch return Error.DimensionMismatch;
+    }
+    t = 0;
+    while (t < T) : (t += 1) threads_buf[t].join();
+}
+
+/// Per-thread worker: matmulSIMD over a slice of A's rows [row_start, row_end).
+fn matmulSIMDRows(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: usize, row_end: usize) Error!void {
+    const N = b.cols;
+    const K = a.cols;
+    const Vec = @Vector(8, f32);
+    const LANE = 8;
+    const n_tail = N - (N % LANE);
+
+    var i = row_start;
+    while (i < row_end) : (i += 1) {
+        const c_row = c.data[i * N ..][0..N];
+        const a_row = a.data[i * K ..][0..K];
+
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            const a_scalar: Vec = @splat(a_row[k]);
+            const b_row = b.data[k * N ..][0..N];
+
+            var j: usize = 0;
+            while (j < n_tail) : (j += LANE) {
+                const bv: Vec = b_row[j..][0..LANE].*;
+                const cv: Vec = c_row[j..][0..LANE].*;
+                c_row[j..][0..LANE].* = cv + a_scalar * bv;
+            }
+            while (j < N) : (j += 1) {
+                c_row[j] += a_row[k] * b_row[j];
+            }
+        }
+    }
+}
+
 /// SIMD matmul. The inner accumulator uses @Vector(8, f32) over the
 /// K dimension. Tail K-elements (K mod 8) are handled in a scalar epilogue.
 ///
@@ -177,6 +258,44 @@ test "matmul SIMD agrees with scalar on (M, K, N) variants" {
         // ~1e-4 relative for moderate K.
         try testing.expect(c_scalar.approxEq(&c_simd, 1e-4));
     }
+}
+
+test "matmulSIMDMulti — T=4 agrees with single-thread on 64x64x64" {
+    const M: usize = 64;
+    const K: usize = 64;
+    const N: usize = 64;
+    var a = try Matrix.init(testing.allocator, M, K);
+    defer a.deinit(testing.allocator);
+    var b = try Matrix.init(testing.allocator, K, N);
+    defer b.deinit(testing.allocator);
+    var c1 = try Matrix.init(testing.allocator, M, N);
+    defer c1.deinit(testing.allocator);
+    var c4 = try Matrix.init(testing.allocator, M, N);
+    defer c4.deinit(testing.allocator);
+
+    a.fillRandom(7);
+    b.fillRandom(11);
+
+    try matmulSIMD(&a, &b, &c1);
+    try matmulSIMDMulti(&a, &b, &c4, 4);
+
+    try testing.expect(c1.approxEq(&c4, 1e-4));
+}
+
+test "matmulSIMDMulti — T=1 falls through to single-thread" {
+    var a = try Matrix.init(testing.allocator, 8, 8);
+    defer a.deinit(testing.allocator);
+    var b = try Matrix.init(testing.allocator, 8, 8);
+    defer b.deinit(testing.allocator);
+    var c = try Matrix.init(testing.allocator, 8, 8);
+    defer c.deinit(testing.allocator);
+    a.fillRandom(3);
+    b.fillRandom(5);
+    try matmulSIMDMulti(&a, &b, &c, 1);
+    // Just verify no errors + result is non-zero
+    var any_nonzero = false;
+    for (c.data) |v| if (v != 0) { any_nonzero = true; break; };
+    try testing.expect(any_nonzero);
 }
 
 test "matmul identity — square matrix vs identity gives the original" {

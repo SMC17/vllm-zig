@@ -128,6 +128,13 @@ pub const Model = struct {
     final_norm: []f32,
     lm_head: Matrix,
     rope_cache: rope.RopeCache,
+    /// Number of threads used by multi-thread kernels. 0 = single-thread.
+    n_threads: usize = 0,
+
+    /// Configure the matmul thread count for subsequent forward passes.
+    pub fn setThreads(self: *Model, n: usize) void {
+        self.n_threads = n;
+    }
 
     pub fn deinit(self: *Model) void {
         self.embed.deinit(self.allocator);
@@ -242,15 +249,15 @@ pub const Model = struct {
             // QKV projections
             var q = try Matrix.init(alloc, seq, q_dim);
             defer q.deinit(alloc);
-            try matmul.matmulSIMD(&x, &layer.w_q, &q);
+            try matmul.matmulSIMDMulti(&x, &layer.w_q, &q, self.n_threads);
 
             var k = try Matrix.init(alloc, seq, kv_dim);
             defer k.deinit(alloc);
-            try matmul.matmulSIMD(&x, &layer.w_k, &k);
+            try matmul.matmulSIMDMulti(&x, &layer.w_k, &k, self.n_threads);
 
             var v = try Matrix.init(alloc, seq, kv_dim);
             defer v.deinit(alloc);
-            try matmul.matmulSIMD(&x, &layer.w_v, &v);
+            try matmul.matmulSIMDMulti(&x, &layer.w_v, &v, self.n_threads);
 
             // RoPE on Q and K
             try self.rope_cache.applyToSequence(q.data, seq, cfg.num_attention_heads, start_pos);
@@ -284,7 +291,7 @@ pub const Model = struct {
             // O projection
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer o_out.deinit(alloc);
-            try matmul.matmulSIMD(&attn_out, &layer.w_o, &o_out);
+            try matmul.matmulSIMDMulti(&attn_out, &layer.w_o, &o_out, self.n_threads);
 
             // Residual add
             for (x.data, residual.data, o_out.data) |*xv, rv, ov| xv.* = rv + ov;
@@ -298,17 +305,17 @@ pub const Model = struct {
             // MLP
             var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer gate.deinit(alloc);
-            try matmul.matmulSIMD(&x, &layer.w_gate, &gate);
+            try matmul.matmulSIMDMulti(&x, &layer.w_gate, &gate, self.n_threads);
 
             var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer up.deinit(alloc);
-            try matmul.matmulSIMD(&x, &layer.w_up, &up);
+            try matmul.matmulSIMDMulti(&x, &layer.w_up, &up, self.n_threads);
 
             try silu.siluMul(gate.data, up.data);
 
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
-            try matmul.matmulSIMD(&gate, &layer.w_down, &down_out);
+            try matmul.matmulSIMDMulti(&gate, &layer.w_down, &down_out, self.n_threads);
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;
         }
@@ -324,13 +331,71 @@ pub const Model = struct {
 
         var logits_m = try Matrix.init(alloc, 1, cfg.vocab_size);
         defer logits_m.deinit(alloc);
-        try matmul.matmulSIMD(&x_last, &self.lm_head, &logits_m);
+        try matmul.matmulSIMDMulti(&x_last, &self.lm_head, &logits_m, self.n_threads);
 
         const logits = try alloc.alloc(f32, cfg.vocab_size);
         @memcpy(logits, logits_m.row(0));
         return logits;
     }
+
+    /// Streaming autoregressive generation. Prefill the prompt, then
+    /// decode N tokens one-at-a-time with KV cache + greedy sampling.
+    /// Yields each new token to the callback. Callback returns `true`
+    /// to continue generating, `false` to stop early.
+    ///
+    /// Returns the generated token IDs (excluding the prompt). Caller
+    /// frees.
+    pub fn generate(
+        self: *Model,
+        alloc: std.mem.Allocator,
+        prompt_ids: []const u32,
+        max_new: usize,
+        kv: *kv_cache_mod.KVCache,
+        on_token: ?*const fn (token: u32, idx: usize) bool,
+    ) ![]u32 {
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(alloc);
+
+        // Prefill: forward the full prompt at once
+        const logits = try self.forward(alloc, prompt_ids, kv, 0);
+        defer alloc.free(logits);
+        const first = try greedyArgmax(logits);
+        try out.append(alloc, first);
+        if (on_token) |cb| {
+            if (!cb(first, 0)) return out.toOwnedSlice(alloc);
+        }
+
+        // Decode: one token at a time
+        var pos = prompt_ids.len;
+        var i: usize = 1;
+        while (i < max_new) : (i += 1) {
+            const one = [_]u32{out.items[out.items.len - 1]};
+            const new_logits = try self.forward(alloc, &one, kv, pos);
+            defer alloc.free(new_logits);
+            const next = try greedyArgmax(new_logits);
+            try out.append(alloc, next);
+            if (on_token) |cb| {
+                if (!cb(next, i)) break;
+            }
+            pos += 1;
+        }
+        return out.toOwnedSlice(alloc);
+    }
 };
+
+fn greedyArgmax(logits: []const f32) !u32 {
+    if (logits.len == 0) return error.EmptyLogits;
+    var best_idx: usize = 0;
+    var best_val: f32 = logits[0];
+    var i: usize = 1;
+    while (i < logits.len) : (i += 1) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best_idx = i;
+        }
+    }
+    return @intCast(best_idx);
+}
 
 fn transposeMatrix(alloc: std.mem.Allocator, m: *const Matrix) !Matrix {
     var out = try Matrix.init(alloc, m.cols, m.rows);

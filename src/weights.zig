@@ -43,14 +43,71 @@ pub fn loadMatrixBF16(
     defer alloc.free(bytes);
     try st.readTensorBytes(t, bytes);
 
-    var i: usize = 0;
-    while (i < numel) : (i += 1) {
-        const lo: u16 = bytes[i * 2];
-        const hi: u16 = bytes[i * 2 + 1];
-        const bits: u16 = (hi << 8) | lo;
-        m.data[i] = bf16_mod.bf16ToF32(bits);
-    }
+    bf16ToF32Parallel(bytes, m.data, 0);
     return m;
+}
+
+/// Parallel BF16 LE bytes → F32 conversion. Splits the work across
+/// std.Thread.getCpuCount() threads (or n_threads if non-zero).
+/// Bandwidth-bound on the byte-shuffle so multi-thread gives near-
+/// linear scaling on modern CPUs.
+pub fn bf16ToF32Parallel(bytes: []const u8, out: []f32, n_threads: usize) void {
+    const numel = out.len;
+    if (numel < 1024) {
+        var i: usize = 0;
+        while (i < numel) : (i += 1) {
+            const lo: u16 = bytes[i * 2];
+            const hi: u16 = bytes[i * 2 + 1];
+            const bits: u16 = (hi << 8) | lo;
+            out[i] = bf16_mod.bf16ToF32(bits);
+        }
+        return;
+    }
+    const T = if (n_threads == 0) (std.Thread.getCpuCount() catch 4) else n_threads;
+    const T_cap = @min(T, 16);
+    const chunk = (numel + T_cap - 1) / T_cap;
+
+    const Args = struct {
+        bytes: []const u8,
+        out: []f32,
+        start: usize,
+        end: usize,
+    };
+
+    var threads: [16]std.Thread = undefined;
+    var args: [16]Args = undefined;
+    var spawned: usize = 0;
+    var t: usize = 0;
+    while (t < T_cap) : (t += 1) {
+        const start = t * chunk;
+        const end = @min(start + chunk, numel);
+        if (start >= numel) break;
+        args[t] = .{ .bytes = bytes, .out = out, .start = start, .end = end };
+        threads[t] = std.Thread.spawn(.{}, struct {
+            fn run(a: *Args) void {
+                var i = a.start;
+                while (i < a.end) : (i += 1) {
+                    const lo: u16 = a.bytes[i * 2];
+                    const hi: u16 = a.bytes[i * 2 + 1];
+                    const bits: u16 = (hi << 8) | lo;
+                    a.out[i] = bf16_mod.bf16ToF32(bits);
+                }
+            }
+        }.run, .{&args[t]}) catch {
+            // Fall back: do this chunk on the calling thread.
+            var i = args[t].start;
+            while (i < args[t].end) : (i += 1) {
+                const lo: u16 = args[t].bytes[i * 2];
+                const hi: u16 = args[t].bytes[i * 2 + 1];
+                const bits: u16 = (hi << 8) | lo;
+                out[i] = bf16_mod.bf16ToF32(bits);
+            }
+            continue;
+        };
+        spawned += 1;
+    }
+    var j: usize = 0;
+    while (j < spawned) : (j += 1) threads[j].join();
 }
 
 /// Load a [D] BF16 vector (e.g., layer norm weights) and convert to F32.
@@ -70,6 +127,8 @@ pub fn loadVectorBF16(
 
     const out = try alloc.alloc(f32, numel);
     errdefer alloc.free(out);
+    // Vectors are typically small (a few thousand for norm weights);
+    // single-thread is fine.
     var i: usize = 0;
     while (i < numel) : (i += 1) {
         const lo: u16 = bytes[i * 2];
