@@ -3,14 +3,11 @@
 Production LLM serving substrate. Zig kernels + (future) BEAM/OTP
 scheduler. PagedAttention design + continuous batching.
 
-**Status:** v0.0.4 — multi-thread + streaming + real TinyLlama inference.
+**Status:** v0.0.5 — multi-thread + streaming + real TinyLlama inference.
 See `ARCHITECTURE.md` for the full design and `STATUS.md` for the
 phase-by-phase position.
 
-**Portfolio position:** Artifact #1 (headline) in the 8-artifact
-jaw-drop portfolio (see `the broader sovereign-stack portfolio`).
-
-## What's here in v0.0.4
+## What's here in v0.0.5
 
 Real end-to-end inference on TinyLlama-1.1B-Chat through pure Zig
 kernels, with streaming generation and multi-thread matmul.

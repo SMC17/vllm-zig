@@ -4,8 +4,6 @@
 must pass before any Phase 1 implementation work begins.
 **Author:** Sean Collins (stax)
 **Last update:** 2026-05-20
-**Portfolio position:** Artifact #1 (headline) in the 8-artifact
-jaw-drop portfolio (see `~/portfolio/README.md`).
 
 ---
 
