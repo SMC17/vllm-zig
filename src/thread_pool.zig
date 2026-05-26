@@ -256,6 +256,19 @@ fn workerLoop(pool: *Pool, id: usize) void {
 fn matmulRowsKernel(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: usize, row_end: usize) void {
     const N = b.cols;
     const K = a.cols;
+
+    // Route through the cache-tiled kernel for high-N high-K shapes
+    // (prefill on TinyLlama-class models). Below this, the row-walk
+    // path's hardware prefetch beats the tile-machinery overhead.
+    // Threshold mirrors matmulSIMDTiled's crossover.
+    //
+    // Pool's matmulRowSplit already @memset'd C to zero; matmulSIMDTiledRows
+    // zeros its own row range again (cheap) so the accumulation is correct.
+    if (N >= 1280 and K >= 512) {
+        matmul_kernels.matmulSIMDTiledRows(a, b, c, row_start, row_end) catch unreachable;
+        return;
+    }
+
     const Vec = @Vector(8, f32);
     const LANE = 8;
     const n_tail = N - (N % LANE);

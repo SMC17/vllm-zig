@@ -358,7 +358,7 @@ pub fn matmulSIMDTiled(a: *const Matrix, b: *const Matrix, c: *Matrix) Error!voi
 /// Cache-tiled row-range matmul — same blocking as matmulSIMDTiled but
 /// restricted to rows [row_start, row_end). Used as a worker by the
 /// thread-pool tiled variants below.
-fn matmulSIMDTiledRows(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: usize, row_end: usize) Error!void {
+pub fn matmulSIMDTiledRows(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: usize, row_end: usize) Error!void {
     if (a.cols != b.rows) return Error.DimensionMismatch;
     if (c.rows != a.rows or c.cols != b.cols) return Error.DimensionMismatch;
     const N = b.cols;
