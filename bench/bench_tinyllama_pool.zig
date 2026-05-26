@@ -96,7 +96,11 @@ pub fn main(init: std.process.Init) !void {
     G.reset();
     G.io_local = io;
     G.t_start = std.Io.Clock.awake.now(io);
-    var kv_a = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.max_position_embeddings, cfg.num_key_value_heads, cfg.head_dim);
+    var pm_a = try vllm.page_manager.PageManager.init(alloc, 2000, cfg.num_key_value_heads, cfg.head_dim);
+    defer pm_a.deinit();
+    var ba_a = try vllm.paged_attention.BlockAllocator.init(alloc, 2000);
+    defer ba_a.deinit();
+    var kv_a = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, &pm_a, &ba_a);
     defer kv_a.deinit();
     const gen_a = try model.generate(alloc, ids_with_bos, max_new, &kv_a, &G.cb);
     defer alloc.free(gen_a);
@@ -119,7 +123,11 @@ pub fn main(init: std.process.Init) !void {
 
     G.reset();
     G.t_start = std.Io.Clock.awake.now(io);
-    var kv_b = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.max_position_embeddings, cfg.num_key_value_heads, cfg.head_dim);
+    var pm_b = try vllm.page_manager.PageManager.init(alloc, 2000, cfg.num_key_value_heads, cfg.head_dim);
+    defer pm_b.deinit();
+    var ba_b = try vllm.paged_attention.BlockAllocator.init(alloc, 2000);
+    defer ba_b.deinit();
+    var kv_b = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, &pm_b, &ba_b);
     defer kv_b.deinit();
     const gen_b = try model.generate(alloc, ids_with_bos, max_new, &kv_b, &G.cb);
     defer alloc.free(gen_b);

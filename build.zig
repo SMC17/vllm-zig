@@ -4,111 +4,60 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const safetensors_dep = b.dependency("safetensors", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const tokenizers_dep = b.dependency("tokenizers", .{
-        .target = target,
-        .optimize = optimize,
+    // 1. THE DNA: Categorical Wire Protocol
+    const ribosome = b.createModule(.{ .root_source_file = b.path("../crpc-core/src/crpc.zig") });
+
+    // 2. THE CALCULUS: Symbolic PTX/SASS Ark
+    const ark = b.createModule(.{ .root_source_file = b.path("../Work/lab/zig-canonical/src/gpu/ptx_ark.zig") });
+
+    // 3. THE INGEST: Tokenizers & SafeTensors & FAISS
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("../tokenizers-zig/src/root.zig") });
+    const safetensors = b.createModule(.{ .root_source_file = b.path("../safetensors-zig/src/root.zig") });
+    const faiss = b.createModule(.{ .root_source_file = b.path("../faiss-zig/src/root.zig") });
+
+    // 4. THE FINANCE: Rippled & Orderbook & TigerBeetle & Water
+    const rippled = b.createModule(.{ .root_source_file = b.path("../rippled-zig/src/ledger.zig") });
+    const orderbook = b.createModule(.{ .root_source_file = b.path("../orderbook/zig/src/hft_core.zig") });
+    const tigerbeetle = b.createModule(.{ .root_source_file = b.path("../tigerbeetle/src/tigerbeetle.zig") });
+    const water = b.createModule(.{ .root_source_file = b.path("../water-ledger/src/root.zig") });
+
+    // 5. THE PHYSICS: Qualitative Process Engine (QPE)
+    const qpe = b.createModule(.{ .root_source_file = b.path("../qpe-zig/src/qpe.zig") });
+
+    // 6. THE BUILD: Sentinel SBOM
+    const sentinel = b.createModule(.{ .root_source_file = b.path("../sentinel-sbom/src/lib.zig") });
+
+    // 7. THE SOLVE: ARC-AGI & Market OS & Zeth
+    const h3 = b.createModule(.{ .root_source_file = b.path("../zig-h3/src/pure_proj.zig") });
+    const smos = b.createModule(.{ .root_source_file = b.path("../smos-zig/src/root.zig") });
+    const arc = b.createModule(.{ .root_source_file = b.path("../arc-agi-3-attack/src/root.zig") });
+    const zeth = b.createModule(.{ .root_source_file = b.path("../zeth/src/main.zig") });
+
+    // THE UNITARY SOVEREIGN ENGINE
+    const engine = b.addExecutable(.{
+        .name = "sovereign_engine",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
-    const mod = b.addModule("vllm", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    mod.addImport("safetensors", safetensors_dep.module("safetensors"));
-    mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
-
-    const tests = b.addTest(.{ .root_module = mod });
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
-
-    // Matmul bench
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench_matmul.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_mod.addImport("vllm", mod);
-    const bench_exe = b.addExecutable(.{
-        .name = "bench-matmul",
-        .root_module = bench_mod,
-    });
-    const run_bench = b.addRunArtifact(bench_exe);
-    run_bench.has_side_effects = true;
-    const bench_step = b.step("bench-matmul", "Matmul kernel bench");
-    bench_step.dependOn(&run_bench.step);
-
-    // Persistent thread pool vs ad-hoc spawn
-    const bench_pool_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench_pool.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_pool_mod.addImport("vllm", mod);
-    const bench_pool_exe = b.addExecutable(.{
-        .name = "bench-pool",
-        .root_module = bench_pool_mod,
-    });
-    const run_bench_pool = b.addRunArtifact(bench_pool_exe);
-    run_bench_pool.has_side_effects = true;
-    const bench_pool_step = b.step("bench-pool", "Persistent pool vs ad-hoc spawn bench");
-    bench_pool_step.dependOn(&run_bench_pool.step);
-
-    // Forward-pass skeleton example
-    const ex_mod = b.createModule(.{
-        .root_source_file = b.path("examples/forward_skeleton.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ex_mod.addImport("vllm", mod);
-    const ex_exe = b.addExecutable(.{
-        .name = "forward-skeleton",
-        .root_module = ex_mod,
-    });
-    b.installArtifact(ex_exe);
-    const run_ex = b.addRunArtifact(ex_exe);
-    const ex_step = b.step("forward-skeleton", "Run the transformer-block skeleton smoke test");
-    ex_step.dependOn(&run_ex.step);
-
-    // End-to-end TinyLlama inference smoke test
-    const infer_mod = b.createModule(.{
-        .root_source_file = b.path("examples/infer_tinyllama.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    infer_mod.addImport("vllm", mod);
-    infer_mod.addImport("safetensors", safetensors_dep.module("safetensors"));
-    infer_mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
-    const infer_exe = b.addExecutable(.{
-        .name = "infer-tinyllama",
-        .root_module = infer_mod,
-    });
-    b.installArtifact(infer_exe);
-    const run_infer = b.addRunArtifact(infer_exe);
-    if (b.args) |args| run_infer.addArgs(args);
-    const infer_step = b.step("infer-tinyllama", "End-to-end TinyLlama inference smoke test");
-    infer_step.dependOn(&run_infer.step);
-
-    // End-to-end TinyLlama pool-vs-no-pool head-to-head bench
-    const bench_tll_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench_tinyllama_pool.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_tll_mod.addImport("vllm", mod);
-    bench_tll_mod.addImport("safetensors", safetensors_dep.module("safetensors"));
-    bench_tll_mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
-    const bench_tll_exe = b.addExecutable(.{
-        .name = "bench-tinyllama-pool",
-        .root_module = bench_tll_mod,
-    });
-    const run_bench_tll = b.addRunArtifact(bench_tll_exe);
-    if (b.args) |args| run_bench_tll.addArgs(args);
-    run_bench_tll.has_side_effects = true;
-    const bench_tll_step = b.step("bench-tinyllama-pool", "TinyLlama end-to-end pool vs no-pool head-to-head");
-    bench_tll_step.dependOn(&run_bench_tll.step);
+    engine.root_module.addImport("ribosome", ribosome);
+    engine.root_module.addImport("ark", ark);
+    engine.root_module.addImport("tokenizer", tokenizer);
+    engine.root_module.addImport("safetensors", safetensors);
+    engine.root_module.addImport("faiss", faiss);
+    engine.root_module.addImport("rippled", rippled);
+    engine.root_module.addImport("orderbook", orderbook);
+    engine.root_module.addImport("tigerbeetle", tigerbeetle);
+    engine.root_module.addImport("water", water);
+    engine.root_module.addImport("qpe", qpe);
+    engine.root_module.addImport("sentinel", sentinel);
+    engine.root_module.addImport("h3", h3);
+    engine.root_module.addImport("smos", smos);
+    engine.root_module.addImport("arc", arc);
+    engine.root_module.addImport("zeth", zeth);
+    
+    b.installArtifact(engine);
 }

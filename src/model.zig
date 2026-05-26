@@ -28,6 +28,7 @@ const silu = @import("kernels/silu.zig");
 const weights_mod = @import("weights.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 const thread_pool = @import("thread_pool.zig");
+const gpu_context_mod = @import("gpu_context.zig");
 
 pub const Config = struct {
     vocab_size: usize,
@@ -138,6 +139,7 @@ pub const Model = struct {
     /// the pool — caller is responsible for init/deinit. Lifetime must
     /// outlast all forward() calls.
     pool: ?*thread_pool.Pool = null,
+    gpu_ctx: ?*gpu_context_mod.GPUContext = null,
 
     /// Configure the matmul thread count for subsequent forward passes.
     pub fn setThreads(self: *Model, n: usize) void {
@@ -152,6 +154,11 @@ pub const Model = struct {
     }
 
     inline fn matmulDispatch(self: *const Model, a: *const Matrix, b: *const Matrix, c: *Matrix) !void {
+        if (self.gpu_ctx) |ctx| {
+            // JIT-compile and Launch Substrate-Native PTX
+            const ptx = try ctx.compileMatmul(a.rows, a.cols, b.cols);
+            return ctx.launch(ptx);
+        }
         if (self.pool) |p| {
             return p.matmulAuto(a, b, c, self.n_threads);
         }
@@ -286,29 +293,42 @@ pub const Model = struct {
             try self.rope_cache.applyToSequence(k.data, seq, cfg.num_key_value_heads, start_pos);
 
             // KV cache append + use full cached K/V for attention
-            const cached_k: []const f32 = if (kv_cache) |c| blk: {
-                try c.append(li, k.data, v.data, seq);
-                break :blk c.getK(li);
-            } else k.data;
-            const cached_v: []const f32 = if (kv_cache) |c| c.getV(li) else v.data;
-            const total_kv_len = if (kv_cache) |c| c.currentLen(li) else seq;
-
             var attn_out = try Matrix.init(alloc, seq, q_dim);
             defer attn_out.deinit(alloc);
-            try attention.attentionGqa(
-                alloc,
-                q.data,
-                cached_k,
-                cached_v,
-                attn_out.data,
-                seq,
-                total_kv_len,
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                true,
-                start_pos,
-            );
+
+            if (kv_cache) |c| {
+                try c.append(li, k.data, v.data, seq);
+                const total_kv_len = c.currentLen(li);
+                try attention.attentionPagedGqa(
+                    alloc,
+                    q.data,
+                    c.page_manager,
+                    c.block_tables[li].items,
+                    attn_out.data,
+                    seq,
+                    total_kv_len,
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    true,
+                    start_pos,
+                );
+            } else {
+                try attention.attentionGqa(
+                    alloc,
+                    q.data,
+                    k.data,
+                    v.data,
+                    attn_out.data,
+                    seq,
+                    seq,
+                    cfg.num_attention_heads,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    true,
+                    start_pos,
+                );
+            }
 
             // O projection
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);

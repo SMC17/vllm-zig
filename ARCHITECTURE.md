@@ -396,8 +396,8 @@ Per portfolio doctrine:
 - **NVIDIA inference team** — see PagedAttention port + Triton kernels
 - **Together AI / Modal Labs / Anyscale** — see BEAM scheduler as
   alternative to vLLM Python in their stack
-- **Apollo / METR / AISI** — see "production-grade eval-serving
-  substrate" (every eval that calls a model needs serving)
+- **Apollo / METR / AISI** — see eval-serving substrate with explicit
+  proof gates (every eval that calls a model needs serving)
 - **Anthropic Production** — see scheduler + observability surface
 - **vLLM team (Berkeley)** — see collaboration energy, not competition.
   Reach out post-Phase 2 with bench results + cite-and-bench paper.

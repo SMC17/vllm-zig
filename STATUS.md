@@ -1,7 +1,10 @@
 # STATUS
 
-**Version:** v0.0.5 (persistent thread pool — decode regression closed)
+**Version:** v0.0.5 (toy batch-1 generator; **NOT vLLM-equivalent**)
 **Last update:** 2026-05-22
+
+> [!CAUTION]
+> **SCIENTIFIC INTEGRITY WARNING:** Despite the name `vllm-zig`, this repository is currently a **Type 1 scientific overclaim**. It lacks PagedAttention, continuous batching, and speculative decoding—the three pillars that define the vLLM frontier. It is currently a batch-1 sequential text generator. Do not use for production serving until Phase 2 is green.
 
 ## What landed in v0.0.5 (on top of v0.0.4)
 
@@ -67,8 +70,8 @@ Per `ARCHITECTURE.md` §13:
 - Phase 1 complete (multi-block real TinyLlama inference) — done 2026-05-21
 - **v0.0.3 streaming + multi-thread + parallel BF16 load — done 2026-05-21**
 - **v0.0.4 N-axis col-split matmul + auto-dispatch — done 2026-05-22**
-- **v0.0.5 persistent thread pool — done 2026-05-22** ← here
-- Phase 1.5 (PagedAttention + KV cache improvements) — not started
+- **v0.0.5 persistent thread pool — done 2026-05-22**
+- **Phase 1.5 (PagedAttention block substrate) — done 2026-05-22** ← here
 - Phase 2 (continuous batching + HTTP front-end) — not started
 - Phase 3 (LiveView + public v0.1 release) — not started
 

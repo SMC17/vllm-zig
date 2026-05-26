@@ -105,8 +105,8 @@ zig build install -Doptimize=ReleaseFast
 - **No cache tiling, no persistent thread pool, no PagedAttention.**
   Each of these is a measured-bottleneck-driven follow-up, not a
   silent gap.
-- **Pre-1.0 substrate** per the Zig 0.16 ecosystem convention. No
-  "production-grade" / "v1.0" / "stable" claims will be made.
+- **Pre-1.0 substrate** per the Zig 0.16 ecosystem convention. Claims stay
+  below release-readiness language until the evidence changes.
 
 ## License
 

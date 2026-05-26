@@ -45,6 +45,8 @@ pub const sampler = @import("sampler.zig");
 pub const model = @import("model.zig");
 pub const thread_pool = @import("thread_pool.zig");
 pub const Pool = thread_pool.Pool;
+pub const page_manager = @import("page_manager.zig");
+pub const paged_attention = @import("paged_attention.zig");
 
 // ============================================================================
 // Re-export tests — pulls tests from every submodule by referencing them.
@@ -65,4 +67,6 @@ comptime {
     _ = sampler;
     _ = model;
     _ = thread_pool;
+    _ = page_manager;
+    _ = paged_attention;
 }

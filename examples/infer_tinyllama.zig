@@ -58,6 +58,14 @@ pub fn main(init: std.process.Init) !void {
     var model = try vllm.model.Model.loadFromSafeTensors(alloc, &st, cfg);
     defer model.deinit();
     model.setThreads(n_threads);
+    var pool: ?*vllm.thread_pool.Pool = null;
+    if (@import("builtin").os.tag == .linux) {
+        pool = vllm.thread_pool.Pool.init(alloc, n_threads) catch null;
+    }
+    if (pool) |p| {
+        model.setThreadPool(p);
+    }
+    defer if (pool) |p| p.deinit();
     const t_load_end = std.Io.Clock.awake.now(io);
     const load_ms = @as(u64, @intCast(t_load_start.durationTo(t_load_end).nanoseconds)) / 1_000_000;
     std.debug.print("model loaded in {d} ms (BF16→F32 parallel + {d} layers)\n", .{ load_ms, cfg.num_hidden_layers });

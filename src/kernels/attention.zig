@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const softmax = @import("softmax.zig");
+const pm_mod = @import("../page_manager.zig");
 
 pub const Error = error{
     DimensionMismatch,
@@ -185,6 +186,87 @@ pub fn attentionGqa(
         aggregate(scores, v_head_buf, seq_q, seq_kv, head_dim, out_head_buf);
 
         // Scatter back
+        t = 0;
+        while (t < seq_q) : (t += 1) {
+            const src = out_head_buf[t * head_dim ..][0..head_dim];
+            const dst = out[(t * n_q_heads + qh) * head_dim ..][0..head_dim];
+            @memcpy(dst, src);
+        }
+    }
+}
+
+/// Full GQA attention utilizing the PagedAttention Block Allocator
+pub fn attentionPagedGqa(
+    alloc: std.mem.Allocator,
+    q: []const f32,
+    pm: *pm_mod.PageManager,
+    block_table: []const usize,
+    out: []f32,
+    seq_q: usize,
+    seq_kv: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    q_offset: usize,
+) Error!void {
+    if (n_q_heads % n_kv_heads != 0) return Error.InvalidGqaRatio;
+    const group = n_q_heads / n_kv_heads;
+    if (q.len != seq_q * n_q_heads * head_dim) return Error.DimensionMismatch;
+    if (out.len != seq_q * n_q_heads * head_dim) return Error.DimensionMismatch;
+
+    const scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    const scores = try alloc.alloc(f32, seq_q * seq_kv);
+    defer alloc.free(scores);
+
+    const q_head_buf = try alloc.alloc(f32, seq_q * head_dim);
+    defer alloc.free(q_head_buf);
+    const k_head_buf = try alloc.alloc(f32, seq_kv * head_dim);
+    defer alloc.free(k_head_buf);
+    const v_head_buf = try alloc.alloc(f32, seq_kv * head_dim);
+    defer alloc.free(v_head_buf);
+    const out_head_buf = try alloc.alloc(f32, seq_q * head_dim);
+    defer alloc.free(out_head_buf);
+
+    var qh: usize = 0;
+    while (qh < n_q_heads) : (qh += 1) {
+        const kvh = qh / group;
+
+        var t: usize = 0;
+        while (t < seq_q) : (t += 1) {
+            const src = q[(t * n_q_heads + qh) * head_dim ..][0..head_dim];
+            const dst = q_head_buf[t * head_dim ..][0..head_dim];
+            @memcpy(dst, src);
+        }
+
+        const block_size = pm_mod.PageManager.BLOCK_SIZE;
+        t = 0;
+        while (t < seq_kv) : (t += 1) {
+            const block_idx_in_seq = t / block_size;
+            const token_in_block = t % block_size;
+            const physical_idx = block_table[block_idx_in_seq];
+
+            const k_block = pm.getBlockK(physical_idx, kvh);
+            const v_block = pm.getBlockV(physical_idx, kvh);
+
+            const k_src = k_block[token_in_block * head_dim ..][0..head_dim];
+            const v_src = v_block[token_in_block * head_dim ..][0..head_dim];
+
+            @memcpy(k_head_buf[t * head_dim ..][0..head_dim], k_src);
+            @memcpy(v_head_buf[t * head_dim ..][0..head_dim], v_src);
+        }
+
+        scoresOneHead(q_head_buf, k_head_buf, seq_q, seq_kv, head_dim, scale, scores);
+        if (causal) causalMask(scores, seq_q, seq_kv, q_offset);
+
+        var ri: usize = 0;
+        while (ri < seq_q) : (ri += 1) {
+            softmax.softmaxRow(scores[ri * seq_kv ..][0..seq_kv]);
+        }
+
+        aggregate(scores, v_head_buf, seq_q, seq_kv, head_dim, out_head_buf);
+
         t = 0;
         while (t < seq_q) : (t += 1) {
             const src = out_head_buf[t * head_dim ..][0..head_dim];
