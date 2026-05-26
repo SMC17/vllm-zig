@@ -32,6 +32,7 @@ pub const tensor = @import("tensor.zig");
 pub const Matrix = tensor.Matrix;
 
 pub const matmul = @import("kernels/matmul.zig");
+pub const matmul_bf16 = @import("kernels/matmul_bf16.zig");
 pub const rmsnorm = @import("kernels/rmsnorm.zig");
 pub const softmax = @import("kernels/softmax.zig");
 pub const silu = @import("kernels/silu.zig");
@@ -55,6 +56,7 @@ pub const paged_attention = @import("paged_attention.zig");
 comptime {
     _ = tensor;
     _ = matmul;
+    _ = matmul_bf16;
     _ = rmsnorm;
     _ = softmax;
     _ = silu;
