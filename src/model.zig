@@ -21,6 +21,7 @@ const std = @import("std");
 const safetensors = @import("safetensors");
 const Matrix = @import("tensor.zig").Matrix;
 const matmul = @import("kernels/matmul.zig");
+const matmul_bf16 = @import("kernels/matmul_bf16.zig");
 const rmsnorm = @import("kernels/rmsnorm.zig");
 const rope = @import("kernels/rope.zig");
 const attention = @import("kernels/attention.zig");
@@ -128,7 +129,13 @@ pub const Model = struct {
     embed: Matrix,
     layers: []LayerWeights,
     final_norm: []f32,
-    lm_head: Matrix,
+    /// LM head stored as raw BF16 in the layout the matmulBF16 kernel
+    /// consumes directly: rows = hidden_size (K), cols = vocab_size (N).
+    /// At decode time M=1, so the LM-head matmul is the largest single
+    /// memory-bandwidth sink (~131 MB BF16 vs ~262 MB F32 on TinyLlama).
+    /// Keeping it in BF16 halves the bytes the scan has to pull through
+    /// L2/L3 — see matmulBF16SIMD docstring.
+    lm_head_bf16: weights_mod.RawBF16,
     rope_cache: rope.RopeCache,
     /// Number of threads used by multi-thread kernels. 0 = single-thread.
     n_threads: usize = 0,
@@ -170,7 +177,7 @@ pub const Model = struct {
         for (self.layers) |*l| l.deinit(self.allocator);
         self.allocator.free(self.layers);
         self.allocator.free(self.final_norm);
-        self.lm_head.deinit(self.allocator);
+        self.lm_head_bf16.deinit(self.allocator);
         self.rope_cache.deinit();
     }
 
@@ -213,12 +220,15 @@ pub const Model = struct {
         const final_norm = try weights_mod.loadVectorBF16(alloc, st, "model.norm.weight");
         errdefer alloc.free(final_norm);
 
-        var lm_head = if (config.tie_word_embeddings)
-            // For tied-weight models, the lm_head is the embedding transposed.
-            try transposeMatrix(alloc, &embed)
+        // LM head: load as raw BF16 in [hidden_size, vocab_size] layout
+        // so it slots straight into matmul_bf16.matmulBF16SIMD with no
+        // F32 upcast. Tied-weights models re-pun the embed table into
+        // BF16 (it was loaded as F32 above).
+        var lm_head_bf16 = if (config.tie_word_embeddings)
+            try transposedEmbedToBF16(alloc, &embed)
         else
-            try weights_mod.loadMatrixBF16Transposed(alloc, st, "lm_head.weight");
-        errdefer lm_head.deinit(alloc);
+            try weights_mod.loadMatrixBF16RawTransposed(alloc, st, "lm_head.weight");
+        errdefer lm_head_bf16.deinit(alloc);
 
         const rope_cache = try rope.RopeCache.init(
             alloc,
@@ -233,7 +243,7 @@ pub const Model = struct {
             .embed = embed,
             .layers = layers,
             .final_norm = final_norm,
-            .lm_head = lm_head,
+            .lm_head_bf16 = lm_head_bf16,
             .rope_cache = rope_cache,
         };
     }
@@ -365,7 +375,11 @@ pub const Model = struct {
         // 3. Final norm + LM head on the LAST token only
         try rmsnorm.rmsnorm(&x, self.final_norm, cfg.rms_norm_eps);
 
-        // Last-token logits = last row of x @ lm_head
+        // Last-token logits = last row of x @ lm_head, with the LM head
+        // kept in BF16 so the inner-loop B-matrix scan halves its bandwidth
+        // requirement. At TinyLlama scale this is the single largest matmul
+        // in the decode step (M=1, K=2048, N=32000 = ~131 MB BF16 vs ~262 MB
+        // F32). The SIMD kernel widens BF16→F32 in-register, no temp buffer.
         const last_row_x = x.row(seq - 1);
         var x_last = try Matrix.init(alloc, 1, cfg.hidden_size);
         defer x_last.deinit(alloc);
@@ -373,7 +387,13 @@ pub const Model = struct {
 
         var logits_m = try Matrix.init(alloc, 1, cfg.vocab_size);
         defer logits_m.deinit(alloc);
-        try self.matmulDispatch(&x_last, &self.lm_head, &logits_m);
+        try matmul_bf16.matmulBF16SIMD(
+            &x_last,
+            self.lm_head_bf16.data,
+            self.lm_head_bf16.rows,
+            self.lm_head_bf16.cols,
+            &logits_m,
+        );
 
         const logits = try alloc.alloc(f32, cfg.vocab_size);
         @memcpy(logits, logits_m.row(0));
@@ -450,6 +470,29 @@ fn transposeMatrix(alloc: std.mem.Allocator, m: *const Matrix) !Matrix {
         }
     }
     return out;
+}
+
+const bf16_mod = @import("bf16.zig");
+
+/// Tied-weights fallback: requantise the F32 embed table back into BF16
+/// in transposed layout (so it slots into matmul_bf16 the same way the
+/// untied lm_head.weight does).
+fn transposedEmbedToBF16(alloc: std.mem.Allocator, embed: *const Matrix) !weights_mod.RawBF16 {
+    // embed is [vocab_size, hidden_size] (loadMatrixBF16 did NOT transpose).
+    // We want lm_head [hidden_size, vocab_size].
+    const rows: usize = embed.cols; // hidden_size
+    const cols: usize = embed.rows; // vocab_size
+    const data = try alloc.alloc(u16, rows * cols);
+    errdefer alloc.free(data);
+    var r: usize = 0;
+    while (r < embed.rows) : (r += 1) {
+        var c: usize = 0;
+        while (c < embed.cols) : (c += 1) {
+            // embed[r,c] = embed.data[r * embed.cols + c]; goes to data[c, r]
+            data[c * rows + r] = bf16_mod.f32ToBf16(embed.data[r * embed.cols + c]);
+        }
+    }
+    return .{ .data = data, .rows = rows, .cols = cols };
 }
 
 // ============================================================================

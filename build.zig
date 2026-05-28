@@ -4,6 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Two flavors of the safetensors / tokenizers / vllm modules:
+    //   * `mod` — built at the user-selected -Doptimize (default Debug).
+    //     Used by `zig build test` so failing assertions get good traces.
+    //   * `mod_fast` — ReleaseFast. Used by every bench/example step so
+    //     the recorded numbers reflect optimized codegen, not Debug
+    //     overhead (which the historical 581 ms/tok baseline did NOT
+    //     have factored in, and which inflated decode times by ~3x on
+    //     this hardware).
     const safetensors_dep = b.dependency("safetensors", .{
         .target = target,
         .optimize = optimize,
@@ -11,6 +19,14 @@ pub fn build(b: *std.Build) void {
     const tokenizers_dep = b.dependency("tokenizers", .{
         .target = target,
         .optimize = optimize,
+    });
+    const safetensors_fast = b.dependency("safetensors", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const tokenizers_fast = b.dependency("tokenizers", .{
+        .target = target,
+        .optimize = .ReleaseFast,
     });
 
     const mod = b.addModule("vllm", .{
@@ -21,8 +37,16 @@ pub fn build(b: *std.Build) void {
     mod.addImport("safetensors", safetensors_dep.module("safetensors"));
     mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
 
+    const mod_fast = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    mod_fast.addImport("safetensors", safetensors_fast.module("safetensors"));
+    mod_fast.addImport("tokenizers", tokenizers_fast.module("tokenizers"));
+
     // ------------------------------------------------------------------
-    // test
+    // test (Debug)
     // ------------------------------------------------------------------
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
@@ -37,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("vllm", mod);
+    bench_mod.addImport("vllm", mod_fast);
     const bench_exe = b.addExecutable(.{
         .name = "bench-matmul",
         .root_module = bench_mod,
@@ -55,7 +79,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_pool_mod.addImport("vllm", mod);
+    bench_pool_mod.addImport("vllm", mod_fast);
     const bench_pool_exe = b.addExecutable(.{
         .name = "bench-pool",
         .root_module = bench_pool_mod,
@@ -73,7 +97,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_tiled_mod.addImport("vllm", mod);
+    bench_tiled_mod.addImport("vllm", mod_fast);
     const bench_tiled_exe = b.addExecutable(.{
         .name = "bench-tiled",
         .root_module = bench_tiled_mod,
@@ -109,9 +133,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    infer_mod.addImport("vllm", mod);
-    infer_mod.addImport("safetensors", safetensors_dep.module("safetensors"));
-    infer_mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
+    infer_mod.addImport("vllm", mod_fast);
+    infer_mod.addImport("safetensors", safetensors_fast.module("safetensors"));
+    infer_mod.addImport("tokenizers", tokenizers_fast.module("tokenizers"));
     const infer_exe = b.addExecutable(.{
         .name = "infer-tinyllama",
         .root_module = infer_mod,
@@ -130,9 +154,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_tll_mod.addImport("vllm", mod);
-    bench_tll_mod.addImport("safetensors", safetensors_dep.module("safetensors"));
-    bench_tll_mod.addImport("tokenizers", tokenizers_dep.module("tokenizers"));
+    bench_tll_mod.addImport("vllm", mod_fast);
+    bench_tll_mod.addImport("safetensors", safetensors_fast.module("safetensors"));
+    bench_tll_mod.addImport("tokenizers", tokenizers_fast.module("tokenizers"));
     const bench_tll_exe = b.addExecutable(.{
         .name = "bench-tinyllama-pool",
         .root_module = bench_tll_mod,

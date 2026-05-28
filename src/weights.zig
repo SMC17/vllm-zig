@@ -139,6 +139,75 @@ pub fn loadVectorBF16(
     return out;
 }
 
+/// Raw BF16 matrix view + dimensions. The bytes from safetensors are
+/// already little-endian u16, so we just pun them. Caller owns the
+/// returned slice.
+///
+/// Layout follows HF convention: [rows, cols] = [out_features, in_features]
+/// — the SAME shape as the on-disk safetensors tensor (no transpose).
+/// For Llama projection weights you typically want the transposed form
+/// (so x @ W gives [seq, out]); see loadMatrixBF16RawTransposed.
+pub const RawBF16 = struct {
+    data: []u16,
+    rows: usize,
+    cols: usize,
+
+    pub fn deinit(self: *RawBF16, alloc: std.mem.Allocator) void {
+        alloc.free(self.data);
+    }
+};
+
+pub fn loadMatrixBF16Raw(
+    alloc: std.mem.Allocator,
+    st: *safetensors.SafeTensors,
+    name: []const u8,
+) !RawBF16 {
+    const t = st.get(name) orelse return Error.TensorNotFound;
+    if (t.dtype != .bf16) return Error.UnexpectedDtype;
+    if (t.shape.len != 2) return Error.ExpectedMatrix;
+
+    const rows: usize = @intCast(t.shape[0]);
+    const cols: usize = @intCast(t.shape[1]);
+    const numel: usize = rows * cols;
+
+    const bytes = try alloc.alloc(u8, numel * 2);
+    defer alloc.free(bytes);
+    try st.readTensorBytes(t, bytes);
+
+    const out = try alloc.alloc(u16, numel);
+    errdefer alloc.free(out);
+    var i: usize = 0;
+    while (i < numel) : (i += 1) {
+        const lo: u16 = bytes[i * 2];
+        const hi: u16 = bytes[i * 2 + 1];
+        out[i] = (hi << 8) | lo;
+    }
+    return .{ .data = out, .rows = rows, .cols = cols };
+}
+
+/// Load a BF16 matrix as raw u16, then transpose it. Result is
+/// [cols, rows] in row-major, so a downstream matmul A[seq, cols] @
+/// B[cols, rows] = C[seq, rows] reproduces x @ W.T for HF-layout weights.
+pub fn loadMatrixBF16RawTransposed(
+    alloc: std.mem.Allocator,
+    st: *safetensors.SafeTensors,
+    name: []const u8,
+) !RawBF16 {
+    const raw = try loadMatrixBF16Raw(alloc, st, name);
+    defer alloc.free(raw.data);
+
+    const out = try alloc.alloc(u16, raw.rows * raw.cols);
+    errdefer alloc.free(out);
+    var r: usize = 0;
+    while (r < raw.rows) : (r += 1) {
+        var c: usize = 0;
+        while (c < raw.cols) : (c += 1) {
+            out[c * raw.rows + r] = raw.data[r * raw.cols + c];
+        }
+    }
+    return .{ .data = out, .rows = raw.cols, .cols = raw.rows };
+}
+
 /// Convenience: load a matrix and transpose it. HF stores attention
 /// projection weights in [out_features, in_features] layout, but our
 /// matmul expects [in_features, out_features] (so x @ W = result where
