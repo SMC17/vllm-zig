@@ -396,7 +396,7 @@ Per portfolio doctrine:
   alternative to vLLM Python in their stack
 - **Apollo / METR / AISI** — see eval-serving substrate with explicit
   proof gates (every eval that calls a model needs serving)
-- **Anthropic Production** — see scheduler + observability surface
+- **Production-scale inference operators** — see scheduler + observability surface
 - **vLLM team (Berkeley)** — see collaboration energy, not competition.
   Reach out post-Phase 2 with bench results + cite-and-bench paper.
 
