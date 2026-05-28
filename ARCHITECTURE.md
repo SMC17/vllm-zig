@@ -145,9 +145,9 @@ Loads K and V from non-contiguous block IDs into shared memory + accums
 the softmax(QK^T) V output. This is the PagedAttention kernel from
 vLLM. Implementation paths:
 
-- **Phase 1**: Triton implementation (from the broader
-  `triton-kernels` portfolio — see artifact #3). The autotuner does the
-  work the hand-rolled CUDA would.
+- **Phase 1**: Triton implementation referencing the canonical
+  PagedAttention kernel; the autotuner does the work the hand-rolled
+  CUDA would.
 - **Phase 1.5**: CUTLASS-based hand-rolled kernel if Triton has
   measurable overhead on Hopper. Decision deferred until Phase 1
   numbers land.
@@ -263,7 +263,7 @@ class — this is a parity target, not a beat-claim.)
 
 ## 8. Tokenizer integration
 
-`tokenizers-zig` (portfolio artifact #4) provides:
+[`SMC17/tokenizers-zig`](https://github.com/SMC17/tokenizers-zig) provides:
 
 - BPE tokenize / detokenize
 - Pre-tokenization normalisation (NFC + GPT-2-style byte splits)
@@ -275,7 +275,7 @@ tokenize is a future optimization (`tokenizers-zig` v0.2+).
 
 ## 9. Weight loading
 
-`safetensors-zig` (portfolio artifact #4, shipped v0.0.1 2026-05-20)
+[`SMC17/safetensors-zig`](https://github.com/SMC17/safetensors-zig)
 provides the file-format reader. Loading flow:
 
 1. On startup, mmap the safetensors file.
@@ -387,27 +387,9 @@ the open-questions list having a written answer for at least #1
   the design holds together. Open questions #1, #6, and #7 could
   invalidate parts of the plan and extend it by months.
 
-## 15. Audience and inbound mechanics
+## 15. Open-source license
 
-Per portfolio doctrine:
-
-- **NVIDIA inference team** — see PagedAttention port + Triton kernels
-- **Together AI / Modal Labs / Anyscale** — see BEAM scheduler as
-  alternative to vLLM Python in their stack
-- **Apollo / METR / AISI** — see eval-serving substrate with explicit
-  proof gates (every eval that calls a model needs serving)
-- **Production-scale inference operators** — see scheduler + observability surface
-- **vLLM team (Berkeley)** — see collaboration energy, not competition.
-  Reach out post-Phase 2 with bench results + cite-and-bench paper.
-
-Twitter / blog cadence on release: Phase 1.5 milestone (PagedAttention
-landed) ships with a thread + diagrams. Phase 2 ships with bench
-numbers (honest, including losses). Phase 3 ships with the LiveView
-dashboard demo video.
-
-## 16. Open-source license
-
-AGPL-3.0-or-later. Matches the rest of the sovereign-stack portfolio.
+AGPL-3.0-or-later.
 
 The AGPL choice is deliberate for a server: SaaS users have to release
 their modifications. If Together AI / Modal / Anyscale want to deploy
