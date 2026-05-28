@@ -1,5 +1,10 @@
 # vllm-zig
 
+[![CI](https://github.com/SMC17/vllm-zig/actions/workflows/ci.yml/badge.svg)](https://github.com/SMC17/vllm-zig/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SMC17/vllm-zig?sort=semver)](https://github.com/SMC17/vllm-zig/releases)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Zig](https://img.shields.io/badge/Zig-0.16-orange.svg)](https://ziglang.org/)
+
 Production LLM serving substrate. Zig kernels + (future) BEAM/OTP
 scheduler. PagedAttention design + continuous batching.
 
