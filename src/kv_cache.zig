@@ -117,7 +117,7 @@ pub const KVCache = struct {
 const testing = std.testing;
 
 test "KVCache init zeroes storage" {
-    var pm = try pm_mod.PageManager.init(testing.allocator, 100);
+    var pm = try pm_mod.PageManager.init(testing.allocator, 100, 4, 8);
     defer pm.deinit();
     var ba = try ba_mod.BlockAllocator.init(testing.allocator, 100);
     defer ba.deinit();
@@ -129,15 +129,15 @@ test "KVCache init zeroes storage" {
 }
 
 test "KVCache append grows block table" {
-    var pm = try pm_mod.PageManager.init(testing.allocator, 100);
+    var pm = try pm_mod.PageManager.init(testing.allocator, 100, 2, 4);
     defer pm.deinit();
     var ba = try ba_mod.BlockAllocator.init(testing.allocator, 100);
     defer ba.deinit();
 
     var c = try KVCache.init(testing.allocator, 1, 2, 4, &pm, &ba);
     defer c.deinit();
-    
-    // 17 tokens max needed (1 + 16)
+
+    // 17 tokens max needed (1 + 16). k/v laid out as [token, n_kv_heads * head_dim] = [token, 2*4=8]
     var k = [_]f32{1.0} ** (17 * 8);
     var v = [_]f32{2.0} ** (17 * 8);
     

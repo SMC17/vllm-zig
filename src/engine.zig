@@ -20,16 +20,21 @@ pub const Engine = struct {
     pub fn init(allocator: std.mem.Allocator, model: *model_mod.Model, total_blocks: usize) !*Engine {
         const self = try allocator.create(Engine);
         const pm = try allocator.create(pm_mod.PageManager);
-        pm.* = try pm_mod.PageManager.init(allocator, total_blocks);
-        
+        pm.* = try pm_mod.PageManager.init(
+            allocator,
+            total_blocks,
+            model.config.num_key_value_heads,
+            model.config.head_dim,
+        );
+
         const ba = try allocator.create(ba_mod.BlockAllocator);
         ba.* = try ba_mod.BlockAllocator.init(allocator, total_blocks);
 
         const kv = try kv_mod.KVCache.init(
-            allocator, 
-            model.config.num_hidden_layers, 
-            model.config.num_key_value_heads, 
-            model.config.head_dim, 
+            allocator,
+            model.config.num_hidden_layers,
+            model.config.num_key_value_heads,
+            model.config.head_dim,
             pm, ba
         );
 

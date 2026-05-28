@@ -1,64 +1,44 @@
-const std = @import("std");
-const ark_mod = @import("ark_bridge"); // Path-mapped to zig-canonical/src/gpu/ptx_ark.zig
+//! GPU context — placeholder for the future PTX/SASS JIT path.
+//!
+//! v0.0.6 ships CPU-only kernels; this module is kept as a hook so the
+//! Model.matmulDispatch() path can early-return through a non-null
+//! `gpu_ctx`. The earlier wiring depended on an external `ark_bridge`
+//! module that lives outside this repo and is gated behind a much
+//! larger toolchain decision; until that lands, GPUContext.init() is
+//! a stub that returns a no-op handle.
+//!
+//! When the PTX/SASS lane is ready, the methods below can be filled in
+//! and the build.zig flipped to add the bridge import.
 
-/// Project Omega-Scalar: vLLM-zig GPU Context
-///
-/// Bridges the vLLM-zig inference engine to the KircherArk PTX JIT emitter.
-/// Manages the JIT-compiled kernels and their physical execution.
+const std = @import("std");
+
 pub const GPUContext = struct {
     allocator: std.mem.Allocator,
-    ark: *ark_mod.KircherArk,
-    kernels: std.StringHashMap([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) !*GPUContext {
         const self = try allocator.create(GPUContext);
-        const ark = try allocator.create(ark_mod.KircherArk);
-        ark.* = ark_mod.KircherArk.init(allocator);
-        
-        self.* = .{
-            .allocator = allocator,
-            .ark = ark,
-            .kernels = std.StringHashMap([]const u8).init(allocator),
-        };
+        self.* = .{ .allocator = allocator };
         return self;
     }
 
     pub fn deinit(self: *GPUContext) void {
-        var it = self.kernels.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.kernels.deinit();
-        self.ark.deinit();
-        self.allocator.destroy(self.ark);
         self.allocator.destroy(self);
     }
 
-    /// JIT-compile a matmul kernel for a specific shape.
-    /// This is where we bridge the Category Theory Morphism DNA 
-    /// to the physical substrate.
+    /// Stub: returns an empty PTX blob. The real implementation will
+    /// JIT-compile a shape-specialised matmul kernel.
     pub fn compileMatmul(self: *GPUContext, m: usize, k: usize, n: usize) ![]const u8 {
-        var buf: [128]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "matmul_{d}_{d}_{d}", .{ m, k, n });
-        
-        if (self.kernels.get(name)) |existing| return existing;
-
-        // Use KircherArk to build the AST
-        // (In full implementation, we define the matmul AST nodes)
-        
-        // Mock PTX emission via the Ark for now
-        const ptx = try self.ark.compilePtx(name);
-        try self.kernels.put(try self.allocator.dupe(u8, name), ptx);
-        
-        std.debug.print("[GPU Context] JIT-compiled kernel: {s}\n", .{name});
-        return ptx;
+        _ = self;
+        _ = m;
+        _ = k;
+        _ = n;
+        return error.GpuNotConfigured;
     }
 
-    /// Execute the compiled PTX kernel.
-    /// (Mock: In a real system, this calls cuModuleLoadData + cuLaunchKernel)
+    /// Stub: would cuModuleLoadData + cuLaunchKernel.
     pub fn launch(self: *GPUContext, kernel_ptx: []const u8) !void {
         _ = self;
         _ = kernel_ptx;
-        // Substrate-native launch logic
+        return error.GpuNotConfigured;
     }
 };
