@@ -60,19 +60,16 @@ total (8 tok)   |  7,978 ms    |  6,797 ms    | 1.2x faster
 
 Real model behavior, real kernels, real tokens streamed out. The 25-
 second model load is parallel BF16→F32 (2.3x v0.0.3). The 1.6x
-prefill is multi-thread matmul row-split. Decode regression is
-documented in `STATUS.md`: ad-hoc spawn cost dominates at M=1; the
-fix is a persistent thread pool (v0.0.5, gated on Zig 0.16
-`std.Io.Mutex` / `std.Io.Condition` scaffolding).
+prefill is multi-thread matmul row-split. The v0.0.4 decode
+regression (ad-hoc `std.Thread.spawn` cost dominating at M=1) was
+closed in v0.0.5 with a Linux-futex-backed persistent worker
+pool — see `CHANGELOG.md` and `STATUS.md` for the numbers.
 
-19 unit tests pass. SIMD ↔ scalar matmul agreement verified at 7
-(M, K, N) shape variants.
+69 unit tests pass at v0.0.5 (+11 from v0.0.4). SIMD ↔ scalar
+matmul agreement verified at 7 (M, K, N) shape variants.
 
 ## What's NOT here (per ARCHITECTURE.md phase plan)
 
-- **Persistent thread pool** (decode M=1 multi-thread parity) →
-  v0.0.5, gated on `std.Io.Mutex` + `std.Io.Condition` Io-threading
-  refactor
 - **Cache-tiled matmul** (N=1024 GFLOPS drops to 4.4 because the
   working set blasts L2/L3) → v0.0.6
 - **PagedAttention KV cache** → Phase 1.5
@@ -83,7 +80,7 @@ fix is a persistent thread pool (v0.0.5, gated on Zig 0.16
 ## Build
 
 ```sh
-zig build test                  # 19 unit tests
+zig build test                  # 69 unit tests at v0.0.5
 zig build forward-skeleton      # Wiring smoke test
 zig build bench-matmul          # Matmul scalar vs SIMD speedup table
 zig build infer-tinyllama       # End-to-end TinyLlama inference
@@ -97,11 +94,11 @@ zig build install -Doptimize=ReleaseFast
   GPU/CUDA scheduling. Fair comparison requires Phase 2 (continuous
   batching + HTTP front-end + GPU kernels). Until then this is a
   kernel + correctness substrate, not a serving substrate.
-- **CPU only at v0.0.4.** No GPU code. Per ARCHITECTURE.md, GPU
+- **CPU only at v0.0.5.** No GPU code. Per ARCHITECTURE.md, GPU
   paths are hardware-gated on Ampere+.
-- **No cache tiling, no persistent thread pool, no PagedAttention.**
-  Each of these is a measured-bottleneck-driven follow-up, not a
-  silent gap.
+- **No cache tiling, no PagedAttention.** Each is a
+  measured-bottleneck-driven follow-up scheduled in
+  ARCHITECTURE.md, not a silent gap.
 - **Pre-1.0 substrate** per the Zig 0.16 ecosystem convention. Claims stay
   below release-readiness language until the evidence changes.
 
@@ -115,7 +112,5 @@ commercial license. Standard sovereign-stack posture.
 
 - `ARCHITECTURE.md` — full design doc (16 sections, ~400 lines)
 - `STATUS.md` — phase-by-phase status
-- `the broader sovereign-stack portfolio` — overall portfolio doctrine
-- `~/safetensors-zig/` — weight-loading dependency (artifact #4a)
-- `~/tokenizers-zig/` — tokenization dependency (artifact #4b)
-- `~/triton-rope/` — RoPE kernel reference (artifact #3)
+- [`SMC17/safetensors-zig`](https://github.com/SMC17/safetensors-zig) — weight-loading dependency
+- [`SMC17/tokenizers-zig`](https://github.com/SMC17/tokenizers-zig) — tokenization dependency
