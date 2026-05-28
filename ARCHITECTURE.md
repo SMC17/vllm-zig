@@ -103,7 +103,7 @@ schedulers can hiccup under NIF load > ~10ms). Both paths are well-trod.
   is real production value, not a toy.
 - The "vLLM-zig" naming is acceptable because the **kernel layer is
   Zig**. The scheduler being Elixir/OTP is the load-bearing
-  architectural choice that makes the design plausible at solo+Claude
+  architectural choice that makes the design plausible at small-team
   scale.
 
 ### Why not pure Elixir?
@@ -383,7 +383,7 @@ the open-questions list having a written answer for at least #1
 - **Hardware-gated phases.** Phase 1 perf and beyond require Ampere+
   GPU access. If that access doesn't materialize, the project halts
   honestly at the Turing-correctness floor.
-- **Solo + Claude scale.** A 4–6 month timeline is realistic only if
+- **Small-team scale.** A 4–6 month timeline is realistic only if
   the design holds together. Open questions #1, #6, and #7 could
   invalidate parts of the plan and extend it by months.
 
