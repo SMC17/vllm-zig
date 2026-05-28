@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "vllm-zig: Pure-Zig LLM serving substrate"
+abstract: "Real TinyLlama-1.1B forward pass through Zig kernels: RoPE + grouped-query attention + KV cache + multi-thread SIMD matmul + streaming generation. AGPL-3.0."
+authors:
+  - family-names: Collins
+    given-names: Sean
+    email: sean@sunlitmoon.online
+    affiliation: independent
+url: "https://github.com/SMC17/vllm-zig"
+repository-code: "https://github.com/SMC17/vllm-zig"
+version: "0.0.5"
+date-released: "2026-05-22"
+license: AGPL-3.0-or-later
+keywords:
+  - zig
+  - llm
+  - inference
+  - tinyllama
+  - paged-attention
+  - ml-infra
+references:
+  - type: article
+    title: "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+    authors:
+      - family-names: Kwon
+        given-names: Woosuk
+    year: 2023
+    url: "https://arxiv.org/abs/2309.06180"
+  - type: conference-paper
+    title: "Orca: A Distributed Serving System for Transformer-Based Generative Models"
+    authors:
+      - family-names: Yu
+        given-names: Gyeong-In
+    year: 2022
+    conference:
+      name: "OSDI 2022"
