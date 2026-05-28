@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.0.6 — 2026-05-27
+
+**Repair pass: restore test+bench wiring; wire BF16 lm_head into forward.**
+
+The v0.0.5 engine-refactor commit (`e0dec6b`) had three load-bearing
+breaks that this release closes:
+
+- `src/page_manager.zig` was reduced to a 2-arg `init(alloc, num_blocks)`
+  with hardcoded n_heads=32, dim=64 and lost the `getBlockK` /
+  `getBlockV` accessors that `kv_cache.zig` and `kernels/attention.zig`
+  both depended on. Restored to 4-arg `init(alloc, num_blocks,
+  n_kv_heads, head_dim)` with split K/V planes.
+- `build.zig` had been replaced with a "sovereign_engine" wiring that
+  imported many sibling repos with no resolvable build graph and had
+  no `test` or `bench-tinyllama-pool` step. Restored the test + bench
+  surface; every bench/example step now compiles the vllm + safetensors
+  + tokenizers modules in `.ReleaseFast` so the recorded numbers reflect
+  optimised codegen (the historical pipeline silently pulled in a
+  Debug-mode vllm).
+- `src/gpu_context.zig` imported a missing `ark_bridge` module. Stubbed
+  to a no-op handle that returns `error.GpuNotConfigured`; the PTX/SASS
+  lane is gated behind a separate toolchain decision.
+
+New BF16 forward-pass wiring:
+
+- `src/weights.zig`: `RawBF16` + `loadMatrixBF16Raw` +
+  `loadMatrixBF16RawTransposed` return the on-disk u16 bytes punned
+  in row-major layout with no F32 upcast.
+- `src/model.zig`: `Model.lm_head_bf16` replaces the F32 `lm_head`
+  Matrix; the decode-time logits matmul in `forward()` now calls
+  `matmul_bf16.matmulBF16SIMD` directly against the raw u16 view.
+  This is the single largest matmul in TinyLlama decode (M=1, K=2048,
+  N=32000 = ~131 MB BF16 vs ~262 MB F32), so it is the highest-leverage
+  callsite to migrate first.
+
+See STATUS.md for the measured numbers and the Type-II watch note.
+
 ## 0.0.5 — 2026-05-22
 
 **Persistent thread pool — closes the v0.0.4 decode regression.**

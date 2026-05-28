@@ -1,7 +1,68 @@
 # STATUS
 
-**Version:** v0.0.5 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-22
+**Version:** v0.0.6 (toy batch-1 generator; **NOT vLLM-equivalent**)
+**Last update:** 2026-05-27
+
+## v0.0.6 — kv_cache + build.zig repair, BF16 lm_head wired
+
+Three load-bearing fixes on top of v0.0.5:
+
+1. `src/page_manager.zig` restored to the 4-arg `init(alloc, num_blocks,
+   n_kv_heads, head_dim)` signature with explicit K/V plane split. The
+   v0.0.5 refactor had reduced it to 2-arg + hardcoded n_heads=32, dim=64,
+   which broke compilation in `kv_cache.zig` and `attention.zig` (both
+   call `getBlockK`/`getBlockV`).
+2. `build.zig` had been replaced with a "sovereign_engine" wiring that
+   imported many sibling repos with no resolvable build graph and had
+   no `test` or `bench-tinyllama-pool` step. Restored test + bench
+   surface; every bench/example step now compiles the vllm + safetensors
+   + tokenizers modules in `.ReleaseFast` (the historical pipeline had
+   silently pulled in a Debug-mode vllm, inflating decode wall-time by
+   ~3× and hiding what optimised codegen actually buys).
+3. `src/model.zig` keeps the LM head as raw BF16 (`Model.lm_head_bf16:
+   weights_mod.RawBF16`) and routes the decode-time logits matmul
+   through `matmul_bf16.matmulBF16SIMD`. Largest single matmul in
+   TinyLlama decode (M=1, K=2048, N=32000 ≈ 131 MB BF16 vs 262 MB F32);
+   halving the B-matrix bytes pulled through L2/L3 is exactly the
+   bandwidth-bound case the BF16 kernel was built for.
+
+### Bench (TinyLlama-1.1B end-to-end, 8-token decode, ReleaseFast, T=8)
+
+```
+prompt: "The capital of France is"  max_new=8
+
+(A) no pool — matmulSIMDAuto (v0.0.4)
+    first-token (prefill+1):  8716 ms
+    decode ms/tok:            3369
+
+(B) with persistent pool (v0.0.5)
+    first-token (prefill+1):  7076 ms
+    decode ms/tok:            1330       <- v0.0.6 measured
+```
+
+### Type-II watch — number does NOT compare cleanly to the 581 ms/tok line
+
+The historical 581 ms/tok baseline in the v0.0.5 section below was
+measured on a *clean* machine. The 1330 ms/tok number above was
+measured at **load average ~44 on an 8-core CPU** (forge_athlete_kernel
+processes were saturating the box during the run). Three factors mix
+in the gap:
+
+  1. **System load:** 8 vllm-zig worker threads were contending with
+     ~15 already-resident background processes for CPU time.
+  2. **PagedAttention now in the forward path:** v0.0.5→v0.0.6 added
+     paged K/V scatter/gather inside `model.forward`, replacing the
+     contiguous-cache code path. That adds per-token block-table
+     dispatch overhead even at seq_kv = 8.
+  3. **BF16 lm_head:** this *should* be a win on a clean machine
+     (bandwidth-bound case), but its effect is not isolated by the
+     numbers above.
+
+A repeat bench on an unloaded machine is needed before claiming the
+BF16 wiring is a perf win. Until then this is engineering-correct, not
+performance-confirmed.
+
+---
 
 > [!CAUTION]
 > **SCIENTIFIC INTEGRITY WARNING:** Despite the name `vllm-zig`, this repository is currently a **Type 1 scientific overclaim**. It lacks PagedAttention, continuous batching, and speculative decoding—the three pillars that define the vLLM frontier. It is currently a batch-1 sequential text generator. Do not use for production serving until Phase 2 is green.
