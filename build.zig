@@ -129,6 +129,29 @@ pub fn build(b: *std.Build) void {
     infer_step.dependOn(&run_infer.step);
 
     // ------------------------------------------------------------------
+    // bench-lmhead-bf16-vs-f32 — isolates the BF16 lm_head bandwidth claim
+    // (BENCH.md section 3.2 / 4.2). Single-thread, no pool, no tiling.
+    // Compares matmul.matmulSIMD (F32 weights) against
+    // matmul_bf16.matmulBF16SIMD (BF16 weights) at three TinyLlama-class
+    // shapes with M=1 (single-token decode). Reports median + p10/p90
+    // over 30 per-call samples.
+    // ------------------------------------------------------------------
+    const bench_bf16_vs_f32_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_lmhead_bf16_vs_f32.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_bf16_vs_f32_mod.addImport("vllm", mod_fast);
+    const bench_bf16_vs_f32_exe = b.addExecutable(.{
+        .name = "bench-lmhead-bf16-vs-f32",
+        .root_module = bench_bf16_vs_f32_mod,
+    });
+    const run_bench_bf16_vs_f32 = b.addRunArtifact(bench_bf16_vs_f32_exe);
+    run_bench_bf16_vs_f32.has_side_effects = true;
+    const bench_bf16_vs_f32_step = b.step("bench-lmhead-bf16-vs-f32", "BF16 vs F32 lm_head matmul microbench");
+    bench_bf16_vs_f32_step.dependOn(&run_bench_bf16_vs_f32.step);
+
+    // ------------------------------------------------------------------
     // bench-tinyllama-pool — end-to-end pool-vs-no-pool head-to-head
     // ------------------------------------------------------------------
     const bench_tll_mod = b.createModule(.{
@@ -143,6 +166,13 @@ pub fn build(b: *std.Build) void {
         .name = "bench-tinyllama-pool",
         .root_module = bench_tll_mod,
     });
+    // Link Accelerate on macOS for the cblas_sgemm lm_head fast path
+    // in Model.forward. Harmless on other targets — the framework
+    // step is only added when the host target is macOS.
+    if (target.result.os.tag == .macos) {
+        bench_tll_mod.linkFramework("Accelerate", .{});
+        bench_tll_mod.link_libc = true;
+    }
     const run_bench_tll = b.addRunArtifact(bench_tll_exe);
     if (b.args) |args| run_bench_tll.addArgs(args);
     run_bench_tll.has_side_effects = true;
