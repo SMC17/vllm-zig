@@ -1,4 +1,4 @@
-# BENCH — vllm-zig perf measurement methodology + v0.0.6 results
+# BENCH -- vllm-zig perf measurement methodology + v0.0.6 results
 
 **Status:** in-progress, internal substrate work
 **Date:** 2026-05-29
@@ -26,7 +26,7 @@ numbers cannot be compared. Three confounders mix in:
 1. System load (8 vllm-zig workers contending with 15+ already-resident
    background processes)
 2. PagedAttention entered the forward path between v0.0.5 and v0.0.6
-3. BF16 lm_head wiring is new — its effect is not isolated
+3. BF16 lm_head wiring is new -- its effect is not isolated
 
 The 30-day perf gate is **200 ms/tok by 2026-06-25**. Until we have
 clean-machine numbers and an isolated BF16 win, that gate is
@@ -92,7 +92,7 @@ microoptimisation.
 
 ---
 
-## 2. Load preconditions — refuse-to-bench rule
+## 2. Load preconditions -- refuse-to-bench rule
 
 A bench number that gets recorded MUST be produced with the box in
 the following state:
@@ -110,7 +110,7 @@ no other user-owned compute daemon at >1% CPU
 
 If any of these fail, the bench MUST either:
 
-- Not run, and `BENCH.md` records "skipped — load X, 4s-busy Y%"
+- Not run, and `BENCH.md` records "skipped -- load X, 4s-busy Y%"
 - Run anyway with an explicit `# LOAD-VIOLATED` banner on every row,
   and the resulting numbers tagged "noise-dominated, not a perf claim"
 
@@ -124,17 +124,17 @@ unfortunately did not flag clearly enough.
 
 The 17-day uptime accumulated these background daemons:
 
-- `forge_athlete_kernel` — 16+ instances, each ~12% CPU, total ≈ 200% of an
+- `forge_athlete_kernel` -- 16+ instances, each ~12% CPU, total ≈ 200% of an
   8-core box. Long-running compute experiments owned by the user. **Not
   to be killed without explicit user authorisation** (per the
   "Son-of-Anton" memory rule: one-shot kill authorisation is not
   general kill authorisation).
-- `ollama runner` — model server. Stop with `pkill ollama` IF the
+- `ollama runner` -- model server. Stop with `pkill ollama` IF the
   user confirms.
-- `nix build .#homeConfigurations.stax.activationPackage` — system
+- `nix build .#homeConfigurations.stax.activationPackage` -- system
   rebuild in progress. Wait for completion or interrupt with user
   authorisation.
-- `zig build` (faiss-zig, sovereign-daw, etc.) — sibling-repo
+- `zig build` (faiss-zig, sovereign-daw, etc.) -- sibling-repo
   compiles. Wait for completion.
 
 **This session ran benches without quiescing forge_athlete_kernel.**
@@ -156,7 +156,7 @@ seed:        none (greedy via argmax; deterministic given identical
              prompt + model weights)
 fixture:     ../safetensors-zig/tests/fixtures/tinyllama-real
              (2.2 GB BF16 model.safetensors)
-threads:     std.Thread.getCpuCount() — 8 on this box
+threads:     std.Thread.getCpuCount() -- 8 on this box
 build mode:  ReleaseFast (vllm + safetensors + tokenizers all
              compiled in ReleaseFast via mod_fast in build.zig)
 ```
@@ -172,11 +172,11 @@ shapes (M=1, K=2048):
   lm_head    N=32000  65M elems   262 MB F32 / 131 MB BF16
 iters per sample:  30
 SEED:              42
-single-thread, no pool, no tiling — isolates dtype-only effect
+single-thread, no pool, no tiling -- isolates dtype-only effect
 ```
 
 The lm_head shape is the headline case: B-matrix is 262 MB F32 and
-131 MB BF16. L3 on this box is 8 MB, so neither fits — both pass
+131 MB BF16. L3 on this box is 8 MB, so neither fits -- both pass
 through DRAM. The BF16 path should pull half the bytes per call. If
 the bandwidth-bound claim holds, BF16 should be ~2× faster on lm_head
 and roughly comparable on qkv-proj (qkv 16 MB F32 still busts L3 but
@@ -198,7 +198,7 @@ multiple times and aggregate externally.
 
 ---
 
-## 4. Results — v0.0.6 under LOAD-VIOLATED conditions
+## 4. Results -- v0.0.6 under LOAD-VIOLATED conditions
 
 ### 4.1 Pre-bench state
 
@@ -215,18 +215,18 @@ swap used:            6.8 GiB of 19 GiB
 governor:             powersave (cpu0 at 1.6 GHz, capped from 3.9 GHz max)
 contending procs:     16 × forge_athlete_kernel (each ~12% CPU,
                           running since May 24-25, owned by user,
-                          not killed — see section 2)
+                          not killed -- see section 2)
                       1  × ollama runner (~21% CPU)
                       1  × nix build activationPackage (~24% CPU)
                       2  × zig build (faiss-zig, sovereign-daw,
-                          ~18% CPU each — sibling-repo compiles)
+                          ~18% CPU each -- sibling-repo compiles)
 ```
 
 Load did descend to ~36 by the time the e2e bench finished (the nix
 build and one of the sibling zig builds completed during the run),
 but remained ~18× over the bench precondition for the entire window.
 Per-process CPU share for `bench-tinyllama-pool` measured at 2.3% of
-one logical core (out of 8) during peak — i.e. roughly 1/35th of the
+one logical core (out of 8) during peak -- i.e. roughly 1/35th of the
 effective compute the bench would see on an idle machine.
 
 **Load violated by ~25× on the 1m average.** Every number below is
@@ -242,19 +242,19 @@ across the 30 samples within that run. Three runs gives a feel for
 inter-run drift under heavy contention.
 
 ```
-RUN 1 — load 1m=39.19
+RUN 1 -- load 1m=39.19
 shape                       | f32 med us | f32 p10/p90 | bf16 med us | bf16 p10/p90  | speedup | f32 GB/s | bf16 GB/s
 qkv-proj   K=2048 N=2048    |       1797 | 1755/1848   |        1390 | 1308/1459     |   1.29x |    9.33  |    6.03
 mlp        K=2048 N=5632    |       6566 | 5108/9016   |        6588 | 3961/7806     |   1.00x |    7.03  |    3.50
 lm_head    K=2048 N=32000   |      35423 | 33012/307839|       33131 | 26794/1001741 |   1.07x |    7.40  |    3.96
 
-RUN 2 — load 1m=38.44
+RUN 2 -- load 1m=38.44
 shape                       | f32 med us | f32 p10/p90 | bf16 med us | bf16 p10/p90 | speedup | f32 GB/s | bf16 GB/s
 qkv-proj   K=2048 N=2048    |       1897 | 1744/2106   |        1511 | 1370/2561    |   1.26x |    8.84  |    5.55
 mlp        K=2048 N=5632    |       5648 | 5299/6095   |        4473 | 4087/5552    |   1.26x |    8.17  |    5.16
 lm_head    K=2048 N=32000   |      46081 | 33535/446130|       33973 | 27615/227835 |   1.36x |    5.69  |    3.86
 
-RUN 3 — load 1m=36.14
+RUN 3 -- load 1m=36.14
 shape                       | f32 med us | f32 p10/p90  | bf16 med us | bf16 p10/p90 | speedup | f32 GB/s | bf16 GB/s
 qkv-proj   K=2048 N=2048    |       1769 | 1674/692659  |        1319 | 1277/1349    |   1.34x |    9.48  |    6.36
 mlp        K=2048 N=5632    |       4776 | 4738/4828    |       57155 | 3631/991676  |   0.08x |    9.66  |    0.40
@@ -270,7 +270,7 @@ lm_head                     |      35423 |       33131 |   1.07x |    7.40  |   
 Wide p90/median ratios (lm_head F32 run 3: p90 = 7.6 sec when median
 = 33 ms, a 230× spread) are the load-violated signature. Run 3's MLP
 BF16 row is the clearest contention symptom: median 57 ms is 12×
-worse than F32's 4.7 ms, but p10 = 3.6 ms — i.e. the kernel did
+worse than F32's 4.7 ms, but p10 = 3.6 ms -- i.e. the kernel did
 finish quickly in some samples and got preempted hard in others. The
 3-run-median row treats these as drawn from a noisy distribution and
 takes the per-shape median across runs.
@@ -325,7 +325,7 @@ through L2/L3". Effective bandwidth tells the story:
 - F32 lm_head sustained ≈ 7.4 GB/s at median
 - BF16 lm_head sustained ≈ 3.96 GB/s at median
 - Ratio = 1.87×, i.e. BF16 moves bytes through DRAM at roughly half
-  the rate of F32 — exactly the bandwidth advantage predicted
+  the rate of F32 -- exactly the bandwidth advantage predicted
 
 The byte advantage is real. The wall-time advantage is not, because
 the BF16 path is **not bandwidth-bound on this CPU under this kernel
@@ -350,7 +350,7 @@ Three concrete fixes to recover the bandwidth-bound regime:
   (a) Wider SIMD (AVX-512 zmm, 16 lanes instead of 8) so one widen
       sequence services twice as many multiply-adds, doubling the
       compute-vs-memory ratio. Ice Lake has AVX-512F. Worth trying.
-  (b) Hardware BF16 instructions (AVX-512 BF16 VNNI) — NOT available
+  (b) Hardware BF16 instructions (AVX-512 BF16 VNNI) -- NOT available
       on this Ice Lake CPU; first appeared in Cooper Lake / Sapphire
       Rapids.
   (c) Cache-tiled BF16 matmul so the widen amortises across more
@@ -368,7 +368,7 @@ outstanding work item.
 
 ---
 
-## 5. Gap to 200 ms/tok — where the time goes
+## 5. Gap to 200 ms/tok -- where the time goes
 
 Before any concrete optimisation can be prioritised, we need a
 per-layer or per-region breakdown of where decode time is spent in
@@ -377,7 +377,7 @@ breakdown. The honest answer to "where does the time go" is: we don't
 know yet without instrumentation.
 
 Rough first-principles breakdown for TinyLlama-1.1B decode on
-batch-1, BF16 weights end-to-end (which we don't have — most weights
+batch-1, BF16 weights end-to-end (which we don't have -- most weights
 are still F32 after load conversion):
 
 ```
@@ -400,7 +400,7 @@ achievable but only with weights end-to-end in BF16, not just lm_head.
 
 ---
 
-## 6. Next perf lever ranking — informed by the microbench
+## 6. Next perf lever ranking -- informed by the microbench
 
 The lm_head microbench inverted my prior. Old #1 (end-to-end BF16
 storage) was predicated on BF16 being a 2× win at lm_head shape; the

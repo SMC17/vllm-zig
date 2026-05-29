@@ -1,10 +1,10 @@
-//! BF16 vs F32 lm_head matmul microbench — isolates the bandwidth claim
+//! BF16 vs F32 lm_head matmul microbench -- isolates the bandwidth claim
 //! from the v0.0.6 STATUS.md ("halving the B-matrix bytes pulled through
 //! L2/L3 is exactly the bandwidth-bound case the BF16 kernel was built
 //! for"). The end-to-end TinyLlama bench cannot isolate BF16 lm_head from
 //! attention / MLP / pool-overhead noise; this bench can.
 //!
-//! Shapes exercised (M is always 1 — single-token decode):
+//! Shapes exercised (M is always 1 -- single-token decode):
 //!   - lm_head:            K=2048, N=32000   (65M elems = 130MB F32 / 65MB BF16)
 //!   - mlp:                K=2048, N=5632    (11M elems)
 //!   - qkv-proj:           K=2048, N=2048    ( 4M elems)
@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
         var b_f32 = try Matrix.init(alloc, s.K, s.N);
         for (b_f32.data) |*x| x.* = rng.float(f32);
 
-        // BF16 B (same shape, different dtype, fresh random — we are
+        // BF16 B (same shape, different dtype, fresh random -- we are
         // measuring path latency, not numerical equality)
         const b_bf16 = try alloc.alloc(u16, s.K * s.N);
         for (b_bf16) |*x| x.* = bf16_mod.f32ToBf16(rng.float(f32));
@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         try matmul.matmulSIMD(&a, &b_f32, &c_f32);
         try matmul_bf16.matmulBF16SIMD(&a, b_bf16, s.K, s.N, &c_bf16);
 
-        // F32 samples — per-call timing
+        // F32 samples -- per-call timing
         var iter: usize = 0;
         while (iter < ITERS) : (iter += 1) {
             const t0 = std.Io.Clock.awake.now(io);

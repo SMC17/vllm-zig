@@ -3,7 +3,7 @@
 **Version:** v0.0.6 (toy batch-1 generator; **NOT vLLM-equivalent**)
 **Last update:** 2026-05-29
 
-## 2026-05-29 — BENCH.md landed; BF16 lm_head Type-1 framing corrected
+## 2026-05-29 -- BENCH.md landed; BF16 lm_head Type-1 framing corrected
 
 A measurement pass added `BENCH.md` (methodology + clean-machine
 preconditions + load-violated results). Two findings update the
@@ -13,7 +13,7 @@ v0.0.6 perf-claim posture:
    speedup at the lm_head shape (M=1, K=2048, N=32000) is **1.07×**
    F32 → BF16 on this Ice Lake CPU. Effective bandwidth confirms BF16
    is moving bytes through DRAM at half the rate (F32 7.4 GB/s vs
-   BF16 3.96 GB/s) — the byte-advantage is real, but the kernel is
+   BF16 3.96 GB/s) -- the byte-advantage is real, but the kernel is
    **compute-bound on widen-instructions**, not bandwidth-bound. The
    2× win predicted by the "halving B-matrix bytes" framing requires
    either AVX-512 zmm wider lanes, cache-tiled BF16, or hardware BF16
@@ -25,7 +25,7 @@ v0.0.6 perf-claim posture:
 
 3. **The "1330 ms/tok at load 44" line below is the 2026-05-27
    measurement. A repeat at load 40 produced 48,371 ms/tok decode
-   (pool path) — ~83× the clean-machine v0.0.5 baseline of 581
+   (pool path) -- ~83× the clean-machine v0.0.5 baseline of 581
    ms/tok.** Per-process CPU share was 2.3% of one core; the ratio is
    in the right order of magnitude for the contention level. Neither
    the 1330 ms/tok number nor the 48371 ms/tok number is a perf
@@ -35,7 +35,7 @@ The v0.0.6 perf line stays **engineering-correct, not performance-
 confirmed.** A clean-machine bench (load ≤ 2.0 on this 8-core box)
 must run before the BF16 win is upgraded from "modest, measured at
 1.07× lm_head under load" to "X× on clean baseline." Next perf
-levers ranked in `BENCH.md` section 6 — top of list is pool-the-BF16-
+levers ranked in `BENCH.md` section 6 -- top of list is pool-the-BF16-
 matmul (currently single-thread), then cache-tiled BF16, then
 AVX-512 zmm widen.
 
