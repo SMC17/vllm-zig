@@ -122,20 +122,26 @@ prompt: "The capital of France is"  (max_new=8, ReleaseFast, T=8)
     first-token (prefill+1):  8716 ms
     decode ms/tok:            3369
 
-(B) persistent pool (v0.0.5/v0.0.6)
+(B) persistent pool (v0.0.5, clean machine)
     first-token (prefill+1):  7076 ms
-    decode ms/tok:            1330       (v0.0.6 measured under load avg ~44)
+    decode ms/tok:            581
+
+(C) persistent pool + BF16 lm_head (v0.0.6, clean machine)
+    first-token (prefill+1):  pending clean re-run
+    decode ms/tok:            pending clean re-run
 ```
 
-The v0.0.6 1330 ms/tok number was measured at **load average ~44 on an
-8-core CPU**, not a clean machine — see `STATUS.md` Type-II watch for the
-honest accounting. The historical 581 ms/tok baseline was on a clean
-machine; do not compare across noise floors.
+The v0.0.5 numbers are from a clean machine (load average near zero). The
+v0.0.6 cells are deliberately blank pending a re-bench on a clean machine —
+the prior posting (1330 ms/tok at load avg ~44 on an 8-core CPU) was not
+a fair comparison and has been pulled per audit hygiene. The v0.0.6 BF16
+lm_head architecture stands; the corresponding number lands when a clean
+re-run does.
 
 Real model behavior, real kernels, real tokens streamed out. The 25-second
 model load is parallel BF16→F32 (2.3x v0.0.3). The 1.6x prefill is
 multi-thread matmul row-split. The v0.0.4 decode regression (`std.Thread.spawn`
-cost dominating at M=1) was closed by the persistent worker pool.
+cost dominating at M=1) was closed by the persistent worker pool at v0.0.5.
 
 ## How this fits the portfolio
 

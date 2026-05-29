@@ -178,4 +178,76 @@ pub fn build(b: *std.Build) void {
     run_bench_tll.has_side_effects = true;
     const bench_tll_step = b.step("bench-tinyllama-pool", "TinyLlama end-to-end pool vs no-pool head-to-head");
     bench_tll_step.dependOn(&run_bench_tll.step);
+
+    // ------------------------------------------------------------------
+    // bench-tinyllama-breakdown — per-region decode time via Instrumentation
+    // ------------------------------------------------------------------
+    const bench_bd_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_tinyllama_breakdown.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_bd_mod.addImport("vllm", mod_fast);
+    bench_bd_mod.addImport("safetensors", safetensors_fast.module("safetensors"));
+    bench_bd_mod.addImport("tokenizers", tokenizers_fast.module("tokenizers"));
+    const bench_bd_exe = b.addExecutable(.{
+        .name = "bench-tinyllama-breakdown",
+        .root_module = bench_bd_mod,
+    });
+    const run_bench_bd = b.addRunArtifact(bench_bd_exe);
+    run_bench_bd.has_side_effects = true;
+    const bench_bd_step = b.step("bench-tinyllama-breakdown", "Per-region TinyLlama decode breakdown via Instrumentation");
+    bench_bd_step.dependOn(&run_bench_bd.step);
+
+    // ------------------------------------------------------------------
+    // bench-forward-regions -- multi-round per-region timing (med + p10/p90)
+    // Env-gated: set VLLM_INSTRUMENT=1 to enable instrumentation, and
+    // VLLM_POOLED_LM_HEAD=1 to route the lm_head matmul through
+    // Pool.matmulBF16Auto (v0.0.7 lever #1). Same model, same prompt,
+    // 5 rounds of prefill + 16 decode tokens; reports median + p10/p90
+    // per region under load-violated conditions.
+    // ------------------------------------------------------------------
+    const bench_regions_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_forward_regions.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_regions_mod.addImport("vllm", mod_fast);
+    bench_regions_mod.addImport("safetensors", safetensors_fast.module("safetensors"));
+    bench_regions_mod.addImport("tokenizers", tokenizers_fast.module("tokenizers"));
+    const bench_regions_exe = b.addExecutable(.{
+        .name = "bench-forward-regions",
+        .root_module = bench_regions_mod,
+    });
+    const run_bench_regions = b.addRunArtifact(bench_regions_exe);
+    if (b.args) |args| run_bench_regions.addArgs(args);
+    run_bench_regions.has_side_effects = true;
+    const bench_regions_step = b.step("bench-forward-regions", "Per-region Model.forward timing (set VLLM_INSTRUMENT=1)");
+    bench_regions_step.dependOn(&run_bench_regions.step);
+
+    // ------------------------------------------------------------------
+    // bench-mlp-cblas — MLP-shape F32 SIMD vs cblas_sgemm head-to-head
+    // ------------------------------------------------------------------
+    const bench_mc_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_mlp_cblas.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mc_mod.addImport("vllm", mod_fast);
+    if (target.result.os.tag == .macos) {
+        bench_mc_mod.linkFramework("Accelerate", .{});
+        bench_mc_mod.link_libc = true;
+    } else if (target.result.os.tag == .linux) {
+        bench_mc_mod.link_libc = true;
+        bench_mc_mod.addLibraryPath(.{ .cwd_relative = "/nix/store/z11jjs7wr129hvnrfdgmf0qar7zgfd9i-openblas-0.3.32/lib" });
+        bench_mc_mod.linkSystemLibrary("openblas", .{});
+    }
+    const bench_mc_exe = b.addExecutable(.{
+        .name = "bench-mlp-cblas",
+        .root_module = bench_mc_mod,
+    });
+    const run_bench_mc = b.addRunArtifact(bench_mc_exe);
+    run_bench_mc.has_side_effects = true;
+    const bench_mc_step = b.step("bench-mlp-cblas", "MLP-shape vllm matmulSIMD vs cblas_sgemm");
+    bench_mc_step.dependOn(&run_bench_mc.step);
 }

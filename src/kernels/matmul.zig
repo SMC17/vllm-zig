@@ -271,6 +271,49 @@ pub fn matmulSIMD(a: *const Matrix, b: *const Matrix, c: *Matrix) Error!void {
     }
 }
 
+/// 16-lane SIMD variant — uses @Vector(16, f32) which LLVM compiles to
+/// AVX-512 ZMM register ops on Ice Lake/Skylake-X/Sapphire Rapids
+/// (Linux Ice Lake has avx512f + avx512dq + avx512bw). On platforms
+/// without AVX-512 (Apple ARM NEON-only, older x86), LLVM splits into
+/// two 8-lane operations — same throughput as matmulSIMD on those.
+///
+/// Wins on Intel AVX-512 by halving the J-loop iteration count for
+/// large N (MLP shape N=5632 → 352 16-lane chunks vs 704 8-lane).
+pub fn matmulSIMD16(a: *const Matrix, b: *const Matrix, c: *Matrix) Error!void {
+    if (a.cols != b.rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b.cols) return Error.DimensionMismatch;
+    const M = a.rows;
+    const N = b.cols;
+    const K = a.cols;
+    const Vec = @Vector(16, f32);
+    const LANE = 16;
+    const n_tail = N - (N % LANE);
+
+    @memset(c.data, 0.0);
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const c_row = c.data[i * N ..][0..N];
+        const a_row = a.data[i * K ..][0..K];
+
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            const a_scalar: Vec = @splat(a_row[k]);
+            const b_row = b.data[k * N ..][0..N];
+
+            var j: usize = 0;
+            while (j < n_tail) : (j += LANE) {
+                const bv: Vec = b_row[j..][0..LANE].*;
+                const cv: Vec = c_row[j..][0..LANE].*;
+                c_row[j..][0..LANE].* = cv + a_scalar * bv;
+            }
+            while (j < N) : (j += 1) {
+                c_row[j] += a_row[k] * b_row[j];
+            }
+        }
+    }
+}
+
 /// Cache-tiled SIMD matmul. The non-tiled `matmulSIMD` blasts through L2/L3
 /// at N≥1024 because the entire B matrix gets touched once per output row,
 /// thrashing cache. Cache-tiled rearranges the (i, k, j) loops into outer

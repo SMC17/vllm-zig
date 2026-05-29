@@ -18,10 +18,12 @@
 //!   - Speculative decoding
 
 const std = @import("std");
+const builtin = @import("builtin");
 const safetensors = @import("safetensors");
 const Matrix = @import("tensor.zig").Matrix;
 const matmul = @import("kernels/matmul.zig");
 const matmul_bf16 = @import("kernels/matmul_bf16.zig");
+
 const rmsnorm = @import("kernels/rmsnorm.zig");
 const rope = @import("kernels/rope.zig");
 const attention = @import("kernels/attention.zig");
@@ -30,6 +32,86 @@ const weights_mod = @import("weights.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 const thread_pool = @import("thread_pool.zig");
 const gpu_context_mod = @import("gpu_context.zig");
+
+// ============================================================================
+// Per-region instrumentation
+// ============================================================================
+//
+// The Instrumentation struct accumulates wall-time spent in each named
+// region of Model.forward. The model never owns one; callers (benches,
+// tests) construct an Instrumentation, attach it to the Model with
+// setInstrumentation(), call forward() any number of times, then read
+// totals back. Raw linux.clock_gettime(MONOTONIC) is used so the model
+// path does not need an Io parameter; non-Linux platforms get a no-op
+// timer (region time = 0) without breaking compilation.
+
+pub const Region = enum(u8) {
+    embed = 0,
+    layernorm_input = 1,
+    qkv_proj = 2,
+    rope = 3,
+    attention = 4,
+    o_proj = 5,
+    residual_add_ln = 6,
+    mlp_gate_up = 7,
+    silu_mul = 8,
+    mlp_down = 9,
+    final_norm = 10,
+    lm_head = 11,
+};
+
+pub const region_names = [_][]const u8{
+    "embed",
+    "layernorm_input",
+    "qkv_proj",
+    "rope",
+    "attention",
+    "o_proj",
+    "residual_add_ln",
+    "mlp_gate_up",
+    "silu_mul",
+    "mlp_down",
+    "final_norm",
+    "lm_head",
+};
+
+pub const n_regions = region_names.len;
+
+pub const Instrumentation = struct {
+    // Total ns spent in each region across all forward() calls since
+    // last reset(). Index by @intFromEnum(Region).
+    totals_ns: [n_regions]u64 = [_]u64{0} ** n_regions,
+    // Number of completed forward() calls instrumented (used for mean).
+    n_calls: u64 = 0,
+
+    pub fn reset(self: *Instrumentation) void {
+        self.totals_ns = [_]u64{0} ** n_regions;
+        self.n_calls = 0;
+    }
+
+    pub fn add(self: *Instrumentation, region: Region, ns: u64) void {
+        self.totals_ns[@intFromEnum(region)] += ns;
+    }
+
+    pub fn totalNs(self: *const Instrumentation) u64 {
+        var sum: u64 = 0;
+        for (self.totals_ns) |v| sum += v;
+        return sum;
+    }
+};
+
+/// Returns nanoseconds since CLOCK_MONOTONIC origin. Linux uses
+/// raw clock_gettime to avoid threading Io through Model.forward;
+/// other platforms return 0 (region timings will all be zero -- the
+/// model still runs).
+inline fn nowNs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const secs: u64 = @intCast(ts.sec);
+    const nsecs: u64 = @intCast(ts.nsec);
+    return secs * std.time.ns_per_s + nsecs;
+}
 
 pub const Config = struct {
     vocab_size: usize,
@@ -147,10 +229,33 @@ pub const Model = struct {
     /// outlast all forward() calls.
     pool: ?*thread_pool.Pool = null,
     gpu_ctx: ?*gpu_context_mod.GPUContext = null,
+    /// Optional per-region wall-time accumulator. When set, forward()
+    /// stamps CLOCK_MONOTONIC around each named region (layernorm, qkv,
+    /// attention, lm_head, ...) and totals_ns[] grows by the region's
+    /// elapsed ns. Caller retains ownership.
+    instrument: ?*Instrumentation = null,
+    /// When true, route lm_head matmul through pool.matmulBF16Auto
+    /// instead of the single-thread matmul_bf16.matmulBF16SIMD. Wired
+    /// in v0.0.7. Has no effect unless a pool is also attached.
+    use_pooled_bf16_lm_head: bool = false,
 
     /// Configure the matmul thread count for subsequent forward passes.
     pub fn setThreads(self: *Model, n: usize) void {
         self.n_threads = n;
+    }
+
+    /// Attach a per-region instrumentation accumulator. Caller owns
+    /// the struct and is responsible for reading it back after forward().
+    pub fn setInstrumentation(self: *Model, inst: ?*Instrumentation) void {
+        self.instrument = inst;
+    }
+
+    /// Toggle the pooled BF16 lm_head dispatch. When enabled AND a pool
+    /// is attached, Model.forward routes the final logits matmul through
+    /// pool.matmulBF16Auto (col-split at M=1) instead of the single-
+    /// thread matmul_bf16.matmulBF16SIMD path.
+    pub fn setPooledBF16LMHead(self: *Model, enable: bool) void {
+        self.use_pooled_bf16_lm_head = enable;
     }
 
     /// Attach a persistent thread pool. Caller retains ownership; the pool
@@ -266,7 +371,14 @@ pub const Model = struct {
         const q_dim = cfg.num_attention_heads * cfg.head_dim;
         const kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
+        // Region-timing helpers. inst is null on the hot path; when set,
+        // each region brackets its work with nowNs() and accumulates the
+        // delta into self.instrument.totals_ns. The branch is predictable
+        // (the same null-or-not for the lifetime of the call).
+        const inst = self.instrument;
+
         // 1. Embed: gather rows from embed table
+        const t_embed_start = if (inst != null) nowNs() else 0;
         var x = try Matrix.init(alloc, seq, cfg.hidden_size);
         defer x.deinit(alloc);
         for (token_ids, 0..) |id, t| {
@@ -274,6 +386,7 @@ pub const Model = struct {
             const src = self.embed.row(id);
             @memcpy(x.rowMut(t), src);
         }
+        if (inst) |ip| ip.add(.embed, nowNs() - t_embed_start);
 
         // 2. Multi-block forward
         var residual = try Matrix.init(alloc, seq, cfg.hidden_size);
@@ -283,9 +396,12 @@ pub const Model = struct {
             @memcpy(residual.data, x.data);
 
             // RMSNorm input
+            const t_ln_in_start = if (inst != null) nowNs() else 0;
             try rmsnorm.rmsnorm(&x, layer.norm_input, cfg.rms_norm_eps);
+            if (inst) |ip| ip.add(.layernorm_input, nowNs() - t_ln_in_start);
 
             // QKV projections
+            const t_qkv_start = if (inst != null) nowNs() else 0;
             var q = try Matrix.init(alloc, seq, q_dim);
             defer q.deinit(alloc);
             try self.matmulDispatch(&x, &layer.w_q, &q);
@@ -297,12 +413,16 @@ pub const Model = struct {
             var v = try Matrix.init(alloc, seq, kv_dim);
             defer v.deinit(alloc);
             try self.matmulDispatch(&x, &layer.w_v, &v);
+            if (inst) |ip| ip.add(.qkv_proj, nowNs() - t_qkv_start);
 
             // RoPE on Q and K
+            const t_rope_start = if (inst != null) nowNs() else 0;
             try self.rope_cache.applyToSequence(q.data, seq, cfg.num_attention_heads, start_pos);
             try self.rope_cache.applyToSequence(k.data, seq, cfg.num_key_value_heads, start_pos);
+            if (inst) |ip| ip.add(.rope, nowNs() - t_rope_start);
 
             // KV cache append + use full cached K/V for attention
+            const t_attn_start = if (inst != null) nowNs() else 0;
             var attn_out = try Matrix.init(alloc, seq, q_dim);
             defer attn_out.deinit(alloc);
 
@@ -339,13 +459,18 @@ pub const Model = struct {
                     start_pos,
                 );
             }
+            if (inst) |ip| ip.add(.attention, nowNs() - t_attn_start);
 
             // O projection
+            const t_o_start = if (inst != null) nowNs() else 0;
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer o_out.deinit(alloc);
             try self.matmulDispatch(&attn_out, &layer.w_o, &o_out);
+            if (inst) |ip| ip.add(.o_proj, nowNs() - t_o_start);
 
-            // Residual add
+            // Residual add + post-attention norm bracketed together so
+            // the timing matches the typical fused-residual+ln description.
+            const t_rln_start = if (inst != null) nowNs() else 0;
             for (x.data, residual.data, o_out.data) |*xv, rv, ov| xv.* = rv + ov;
 
             // Save residual for MLP
@@ -353,8 +478,10 @@ pub const Model = struct {
 
             // RMSNorm post-attention
             try rmsnorm.rmsnorm(&x, layer.norm_post_attn, cfg.rms_norm_eps);
+            if (inst) |ip| ip.add(.residual_add_ln, nowNs() - t_rln_start);
 
-            // MLP
+            // MLP: gate + up projections
+            const t_gu_start = if (inst != null) nowNs() else 0;
             var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer gate.deinit(alloc);
             try self.matmulDispatch(&x, &layer.w_gate, &gate);
@@ -362,18 +489,25 @@ pub const Model = struct {
             var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer up.deinit(alloc);
             try self.matmulDispatch(&x, &layer.w_up, &up);
+            if (inst) |ip| ip.add(.mlp_gate_up, nowNs() - t_gu_start);
 
+            const t_silu_start = if (inst != null) nowNs() else 0;
             try silu.siluMul(gate.data, up.data);
+            if (inst) |ip| ip.add(.silu_mul, nowNs() - t_silu_start);
 
+            const t_down_start = if (inst != null) nowNs() else 0;
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
             try self.matmulDispatch(&gate, &layer.w_down, &down_out);
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;
+            if (inst) |ip| ip.add(.mlp_down, nowNs() - t_down_start);
         }
 
         // 3. Final norm + LM head on the LAST token only
+        const t_fn_start = if (inst != null) nowNs() else 0;
         try rmsnorm.rmsnorm(&x, self.final_norm, cfg.rms_norm_eps);
+        if (inst) |ip| ip.add(.final_norm, nowNs() - t_fn_start);
 
         // Last-token logits = last row of x @ lm_head, with the LM head
         // kept in BF16 so the inner-loop B-matrix scan halves its bandwidth
@@ -387,13 +521,44 @@ pub const Model = struct {
 
         var logits_m = try Matrix.init(alloc, 1, cfg.vocab_size);
         defer logits_m.deinit(alloc);
-        try matmul_bf16.matmulBF16SIMD(
-            &x_last,
-            self.lm_head_bf16.data,
-            self.lm_head_bf16.rows,
-            self.lm_head_bf16.cols,
-            &logits_m,
-        );
+
+        // lm_head: BF16 widening path. Two dispatch modes:
+        //
+        //   (a) single-thread matmulBF16SIMD (default, v0.0.6 path):
+        //       the SIMD kernel widens BF16 -> F32 in-register with no
+        //       scratch buffer. Compute-bound on widen-instructions at
+        //       M=1 on Ice Lake (BENCH.md section 4.4).
+        //
+        //   (b) pooled matmulBF16Auto (v0.0.7 path, opt-in via
+        //       setPooledBF16LMHead(true) plus an attached pool):
+        //       col-split across pool workers. At M=1, N=32000 the
+        //       work partitions cleanly. Closes BENCH.md section 6
+        //       lever #1.
+        //
+        // An Accelerate cblas_sgemm variant was tried (see git log +
+        // exp-1780016093-198112588): standalone bench measured 6.92x
+        // faster on M2 Max, but end-to-end decode regressed 8% (104 to
+        // 112 ms/tok, 5-run median). Kept available in the kernel
+        // module for explicit callers but not wired here.
+        const t_lm_start = if (inst != null) nowNs() else 0;
+        if (self.use_pooled_bf16_lm_head) if (self.pool) |p| {
+            try p.matmulBF16Auto(
+                &x_last,
+                self.lm_head_bf16.data,
+                self.lm_head_bf16.rows,
+                self.lm_head_bf16.cols,
+                &logits_m,
+                self.n_threads,
+            );
+        } else {
+            try matmul_bf16.matmulBF16SIMD(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
+        } else {
+            try matmul_bf16.matmulBF16SIMD(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
+        }
+        if (inst) |ip| {
+            ip.add(.lm_head, nowNs() - t_lm_start);
+            ip.n_calls += 1;
+        }
 
         const logits = try alloc.alloc(f32, cfg.vocab_size);
         @memcpy(logits, logits_m.row(0));

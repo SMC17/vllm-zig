@@ -30,6 +30,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Matrix = @import("tensor.zig").Matrix;
 const matmul_kernels = @import("kernels/matmul.zig");
+const matmul_bf16_kernels = @import("kernels/matmul_bf16.zig");
 
 const linux = std.os.linux;
 
@@ -48,12 +49,19 @@ const WorkKind = enum(u32) {
     row_split = 1,
     col_split = 2,
     shutdown = 3,
+    bf16_row_split = 4,
+    bf16_col_split = 5,
 };
 
 const Job = struct {
     a: ?*const Matrix = null,
     b: ?*const Matrix = null,
     c: ?*Matrix = null,
+    // BF16-weights path: B lives as raw u16 plus row/col dims since it
+    // is not a Matrix. When set, b_bf16 is non-null and b is ignored.
+    b_bf16: ?[]const u16 = null,
+    b_bf16_rows: usize = 0,
+    b_bf16_cols: usize = 0,
     ranges: [max_workers][2]usize = [_][2]usize{.{ 0, 0 }} ** max_workers,
 };
 
@@ -164,6 +172,85 @@ pub const Pool = struct {
         return self.matmulColSplit(a, b, c, n_workers);
     }
 
+    /// Column-split BF16-weights matmul (decode path, M=1 typical).
+    /// A is F32, B is raw BF16 (u16), C is F32. Same threading shape
+    /// as matmulColSplit; per-worker kernel widens BF16 -> F32 in
+    /// register via matmul_bf16.matmulBF16SIMD's lane sequence.
+    pub fn matmulBF16ColSplit(
+        self: *Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        n_workers: usize,
+    ) Error!void {
+        if (a.cols != b_rows) return Error.DimensionMismatch;
+        if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+        if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+        if (n_workers <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMD(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+
+        @memset(c.data, 0.0);
+        const N = b_cols;
+        const T = @min(@min(n_workers, N), self.threads.len);
+        if (T <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMD(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+        const chunk = (N + T - 1) / T;
+
+        try self.submitBF16(.bf16_col_split, a, b, b_rows, b_cols, c, T, fillColRanges, .{ chunk, N });
+    }
+
+    /// Row-split BF16-weights matmul (prefill path, M >= n_workers).
+    /// A is F32, B is raw BF16 (u16), C is F32.
+    pub fn matmulBF16RowSplit(
+        self: *Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        n_workers: usize,
+    ) Error!void {
+        if (a.cols != b_rows) return Error.DimensionMismatch;
+        if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+        if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+        const M = a.rows;
+        if (n_workers <= 1 or M <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMD(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+
+        @memset(c.data, 0.0);
+        const T = @min(@min(n_workers, M), self.threads.len);
+        const chunk = (M + T - 1) / T;
+
+        try self.submitBF16(.bf16_row_split, a, b, b_rows, b_cols, c, T, fillRowRanges, .{ chunk, M });
+    }
+
+    /// Auto-dispatch BF16-weights matmul: row-split when M >= n_workers,
+    /// col-split otherwise. Mirrors matmulAuto's policy for the F32 path.
+    pub fn matmulBF16Auto(
+        self: *Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        n_workers: usize,
+    ) Error!void {
+        if (n_workers <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMD(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+        if (a.rows >= n_workers) return self.matmulBF16RowSplit(a, b, b_rows, b_cols, c, n_workers);
+        return self.matmulBF16ColSplit(a, b, b_rows, b_cols, c, n_workers);
+    }
+
     fn submit(
         self: *Pool,
         kind: WorkKind,
@@ -179,6 +266,7 @@ pub const Pool = struct {
         self.job.a = a;
         self.job.b = b;
         self.job.c = c;
+        self.job.b_bf16 = null;
         @call(.auto, fill, .{&self.job.ranges} ++ fill_args);
         self.active_workers.store(@as(u32, @intCast(T)), .release);
         self.n_pending.store(@as(u32, @intCast(T)), .release);
@@ -197,6 +285,44 @@ pub const Pool = struct {
 
         // Reset work_kind back to idle for the next round (workers don't
         // race on this — they've already read it before signaling done).
+        self.work_kind.store(@intFromEnum(WorkKind.idle), .release);
+    }
+
+    fn submitBF16(
+        self: *Pool,
+        kind: WorkKind,
+        a: *const Matrix,
+        b_bf16: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        T: usize,
+        comptime fill: anytype,
+        fill_args: anytype,
+    ) Error!void {
+        // Same race shape as submit(): workers are parked on the OLD
+        // round so per-round job state is publication-safe via the
+        // round.fetchAdd release.
+        self.job.a = a;
+        self.job.b = null;
+        self.job.c = c;
+        self.job.b_bf16 = b_bf16;
+        self.job.b_bf16_rows = b_rows;
+        self.job.b_bf16_cols = b_cols;
+        @call(.auto, fill, .{&self.job.ranges} ++ fill_args);
+        self.active_workers.store(@as(u32, @intCast(T)), .release);
+        self.n_pending.store(@as(u32, @intCast(T)), .release);
+        self.work_kind.store(@intFromEnum(kind), .release);
+
+        _ = self.round.fetchAdd(1, .acq_rel);
+        futexWakeAll(&self.round);
+
+        while (true) {
+            const pending = self.n_pending.load(.acquire);
+            if (pending == 0) break;
+            futexWait(&self.n_pending, pending);
+        }
+
         self.work_kind.store(@intFromEnum(WorkKind.idle), .release);
     }
 };
@@ -237,10 +363,28 @@ fn workerLoop(pool: *Pool, id: usize) void {
         if (id < active) {
             const range = pool.job.ranges[id];
             if (range[0] < range[1]) {
-                if (pool.job.a) |a| if (pool.job.b) |b| if (pool.job.c) |c| {
+                if (pool.job.a) |a| if (pool.job.c) |c| {
                     switch (kind) {
-                        .row_split => matmulRowsKernel(a, b, c, range[0], range[1]),
-                        .col_split => matmulColRangeKernel(a, b, c, range[0], range[1]),
+                        .row_split => if (pool.job.b) |b| matmulRowsKernel(a, b, c, range[0], range[1]),
+                        .col_split => if (pool.job.b) |b| matmulColRangeKernel(a, b, c, range[0], range[1]),
+                        .bf16_row_split => if (pool.job.b_bf16) |bb| matmulBF16RowsKernel(
+                            a,
+                            bb,
+                            pool.job.b_bf16_rows,
+                            pool.job.b_bf16_cols,
+                            c,
+                            range[0],
+                            range[1],
+                        ),
+                        .bf16_col_split => if (pool.job.b_bf16) |bb| matmulBF16ColRangeKernel(
+                            a,
+                            bb,
+                            pool.job.b_bf16_rows,
+                            pool.job.b_bf16_cols,
+                            c,
+                            range[0],
+                            range[1],
+                        ),
                         else => {},
                     }
                 };
@@ -321,6 +465,107 @@ fn matmulColRangeKernel(a: *const Matrix, b: *const Matrix, c: *Matrix, col_star
             }
             while (j < col_end) : (j += 1) {
                 c_row[j] += a_row[k] * b_row[j];
+            }
+        }
+    }
+}
+
+/// BF16-weights row-split per-thread kernel. Walks rows [row_start, row_end)
+/// of A and writes full C rows. Widens B (u16) -> f32 in-register via the
+/// same shift-left-16 lane sequence as matmul_bf16.matmulBF16SIMD.
+fn matmulBF16RowsKernel(
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+    row_start: usize,
+    row_end: usize,
+) void {
+    _ = b_rows;
+    const Vec_u16 = @Vector(8, u16);
+    const Vec_u32 = @Vector(8, u32);
+    const Vec_f32 = @Vector(8, f32);
+    const LANE = 8;
+
+    const N = b_cols;
+    const K = a.cols;
+    const n_tail = N - (N % LANE);
+
+    var i = row_start;
+    while (i < row_end) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+
+        // Pool's matmulBF16RowSplit @memset'd C to zero before submit;
+        // accumulation here is safe.
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            const a_scalar: Vec_f32 = @splat(a_row[k]);
+            const b_row = b[k * N ..][0..N];
+
+            var j: usize = 0;
+            while (j < n_tail) : (j += LANE) {
+                const b_u16v: Vec_u16 = b_row[j..][0..LANE].*;
+                const b_u32v: Vec_u32 = b_u16v;
+                const b_shifted: Vec_u32 = b_u32v << @splat(@as(u5, 16));
+                const b_f32v: Vec_f32 = @bitCast(b_shifted);
+                const cv: Vec_f32 = c_row[j..][0..LANE].*;
+                c_row[j..][0..LANE].* = cv + a_scalar * b_f32v;
+            }
+            while (j < N) : (j += 1) {
+                const bv: f32 = @bitCast(@as(u32, b_row[j]) << 16);
+                c_row[j] += a_row[k] * bv;
+            }
+        }
+    }
+}
+
+/// BF16-weights column-range per-thread kernel. M is implicit (a.rows);
+/// each worker writes columns [col_start, col_end) for ALL rows.
+/// This is the decode-shape path: M=1, N=vocab_size, T workers each own
+/// a vocab slice. Same widen sequence as matmulBF16RowsKernel.
+fn matmulBF16ColRangeKernel(
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+    col_start: usize,
+    col_end: usize,
+) void {
+    _ = b_rows;
+    const Vec_u16 = @Vector(8, u16);
+    const Vec_u32 = @Vector(8, u32);
+    const Vec_f32 = @Vector(8, f32);
+    const LANE = 8;
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            const a_scalar: Vec_f32 = @splat(a_row[k]);
+            const b_row = b[k * N ..][0..N];
+
+            var j = col_start;
+            const aligned_end = col_start + ((col_end - col_start) / LANE) * LANE;
+            while (j < aligned_end) : (j += LANE) {
+                const b_u16v: Vec_u16 = b_row[j..][0..LANE].*;
+                const b_u32v: Vec_u32 = b_u16v;
+                const b_shifted: Vec_u32 = b_u32v << @splat(@as(u5, 16));
+                const b_f32v: Vec_f32 = @bitCast(b_shifted);
+                const cv: Vec_f32 = c_row[j..][0..LANE].*;
+                c_row[j..][0..LANE].* = cv + a_scalar * b_f32v;
+            }
+            while (j < col_end) : (j += 1) {
+                const bv: f32 = @bitCast(@as(u32, b_row[j]) << 16);
+                c_row[j] += a_row[k] * bv;
             }
         }
     }
@@ -465,4 +710,138 @@ test "Pool — 100 consecutive submits reuse the same workers" {
         break;
     };
     try testing.expect(any_nonzero);
+}
+
+const bf16_test_mod = @import("bf16.zig");
+
+fn quantiseToBF16(allocator: std.mem.Allocator, m: *const Matrix) ![]u16 {
+    const out = try allocator.alloc(u16, m.data.len);
+    for (m.data, 0..) |x, i| out[i] = bf16_test_mod.f32ToBf16(x);
+    return out;
+}
+
+test "Pool — BF16 col-split matches single-thread on 1x32x128 (decode shape)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var a = try Matrix.init(testing.allocator, 1, 32);
+    defer a.deinit(testing.allocator);
+    var b_f32 = try Matrix.init(testing.allocator, 32, 128);
+    defer b_f32.deinit(testing.allocator);
+    a.fillRandom(151);
+    b_f32.fillRandom(157);
+
+    const b_bf16 = try quantiseToBF16(testing.allocator, &b_f32);
+    defer testing.allocator.free(b_bf16);
+
+    var c_single = try Matrix.init(testing.allocator, 1, 128);
+    defer c_single.deinit(testing.allocator);
+    var c_pool = try Matrix.init(testing.allocator, 1, 128);
+    defer c_pool.deinit(testing.allocator);
+
+    var pool = try Pool.init(testing.allocator, 4);
+    defer pool.deinit();
+
+    try matmul_bf16_kernels.matmulBF16SIMD(&a, b_bf16, 32, 128, &c_single);
+    try pool.matmulBF16ColSplit(&a, b_bf16, 32, 128, &c_pool, 4);
+
+    try testing.expect(c_single.approxEq(&c_pool, 1e-4));
+}
+
+test "Pool — BF16 row-split matches single-thread on 16x32x48 (prefill shape)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var a = try Matrix.init(testing.allocator, 16, 32);
+    defer a.deinit(testing.allocator);
+    var b_f32 = try Matrix.init(testing.allocator, 32, 48);
+    defer b_f32.deinit(testing.allocator);
+    a.fillRandom(163);
+    b_f32.fillRandom(167);
+
+    const b_bf16 = try quantiseToBF16(testing.allocator, &b_f32);
+    defer testing.allocator.free(b_bf16);
+
+    var c_single = try Matrix.init(testing.allocator, 16, 48);
+    defer c_single.deinit(testing.allocator);
+    var c_pool = try Matrix.init(testing.allocator, 16, 48);
+    defer c_pool.deinit(testing.allocator);
+
+    var pool = try Pool.init(testing.allocator, 4);
+    defer pool.deinit();
+
+    try matmul_bf16_kernels.matmulBF16SIMD(&a, b_bf16, 32, 48, &c_single);
+    try pool.matmulBF16RowSplit(&a, b_bf16, 32, 48, &c_pool, 4);
+
+    try testing.expect(c_single.approxEq(&c_pool, 1e-4));
+}
+
+test "Pool — BF16 auto-dispatch row for M>=T, col for M<T" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pool = try Pool.init(testing.allocator, 4);
+    defer pool.deinit();
+
+    // Row path: M=8 >= T=4
+    var a1 = try Matrix.init(testing.allocator, 8, 16);
+    defer a1.deinit(testing.allocator);
+    var b1_f32 = try Matrix.init(testing.allocator, 16, 24);
+    defer b1_f32.deinit(testing.allocator);
+    a1.fillRandom(173);
+    b1_f32.fillRandom(179);
+    const b1_bf16 = try quantiseToBF16(testing.allocator, &b1_f32);
+    defer testing.allocator.free(b1_bf16);
+    var c1s = try Matrix.init(testing.allocator, 8, 24);
+    defer c1s.deinit(testing.allocator);
+    var c1p = try Matrix.init(testing.allocator, 8, 24);
+    defer c1p.deinit(testing.allocator);
+    try matmul_bf16_kernels.matmulBF16SIMD(&a1, b1_bf16, 16, 24, &c1s);
+    try pool.matmulBF16Auto(&a1, b1_bf16, 16, 24, &c1p, 4);
+    try testing.expect(c1s.approxEq(&c1p, 1e-4));
+
+    // Col path: M=1 < T=4
+    var a2 = try Matrix.init(testing.allocator, 1, 32);
+    defer a2.deinit(testing.allocator);
+    var b2_f32 = try Matrix.init(testing.allocator, 32, 64);
+    defer b2_f32.deinit(testing.allocator);
+    a2.fillRandom(181);
+    b2_f32.fillRandom(191);
+    const b2_bf16 = try quantiseToBF16(testing.allocator, &b2_f32);
+    defer testing.allocator.free(b2_bf16);
+    var c2s = try Matrix.init(testing.allocator, 1, 64);
+    defer c2s.deinit(testing.allocator);
+    var c2p = try Matrix.init(testing.allocator, 1, 64);
+    defer c2p.deinit(testing.allocator);
+    try matmul_bf16_kernels.matmulBF16SIMD(&a2, b2_bf16, 32, 64, &c2s);
+    try pool.matmulBF16Auto(&a2, b2_bf16, 32, 64, &c2p, 4);
+    try testing.expect(c2s.approxEq(&c2p, 1e-4));
+}
+
+test "Pool — BF16 lm_head-shape col-split matches single-thread (M=1, K=2048, N=32000)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Same shape as the real lm_head matmul in Model.forward; verifies
+    // the col-split decomposition reconstructs the full single-thread
+    // output bit-for-bit up to floating accumulation order.
+    const K: usize = 2048;
+    const N: usize = 32000;
+    var a = try Matrix.init(testing.allocator, 1, K);
+    defer a.deinit(testing.allocator);
+    var b_f32 = try Matrix.init(testing.allocator, K, N);
+    defer b_f32.deinit(testing.allocator);
+    a.fillRandom(193);
+    b_f32.fillRandom(197);
+
+    const b_bf16 = try quantiseToBF16(testing.allocator, &b_f32);
+    defer testing.allocator.free(b_bf16);
+
+    var c_single = try Matrix.init(testing.allocator, 1, N);
+    defer c_single.deinit(testing.allocator);
+    var c_pool = try Matrix.init(testing.allocator, 1, N);
+    defer c_pool.deinit(testing.allocator);
+
+    var pool = try Pool.init(testing.allocator, 8);
+    defer pool.deinit();
+
+    try matmul_bf16_kernels.matmulBF16SIMD(&a, b_bf16, K, N, &c_single);
+    try pool.matmulBF16ColSplit(&a, b_bf16, K, N, &c_pool, 8);
+
+    // Same operations partitioned across columns; bit-exact accumulation
+    // because each output column is computed by a single worker walking
+    // K identically.
+    try testing.expect(c_single.approxEq(&c_pool, 1e-3));
 }
