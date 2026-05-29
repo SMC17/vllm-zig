@@ -1,7 +1,54 @@
 # STATUS
 
-**Version:** v0.0.6 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29
+**Version:** v0.0.7 (toy batch-1 generator; **NOT vLLM-equivalent**)
+**Last update:** 2026-05-29 (later)
+
+## 2026-05-29 (later) -- v0.0.7: per-region instrumentation lands; lever-1 target redirected to MLP
+
+The bigger Type-1 catch of the perf push, caught by Step 1
+(instrumentation) before Step 2 (optimize) wasted any more cycles.
+
+**Clean-machine baseline (load 5.91, single-thread BF16 lm_head):**
+
+| Region | med ms / round | share |
+|---|---|---|
+| mlp_gate_up | 2819 | **42.5%** |
+| mlp_down | 1840 | **27.7%** |
+| qkv_proj | 882 | 13.3% |
+| o_proj | 655 | 9.9% |
+| lm_head | 327 | **4.9%** |
+| attention | 47 | 0.7% |
+| (rest) | <60 | <1% |
+
+Decode: med 349 ms/tok over 5 rounds of prefill + 16-token decode.
+
+**With pooled BF16 lm_head enabled (`VLLM_POOLED_LM_HEAD=1`):**
+
+lm_head region 327 ms → 127 ms (**2.6× on the targeted region**).
+Decode med 280 ms/tok in the same window, but the comparison is
+load-confounded: every region got faster between runs, not just
+lm_head, so the total-decode delta cannot be cleanly attributed to
+the pool change. The clean read is "pool works as designed on the
+region it operates on."
+
+**The lever-1 redirect:** lm_head is **5% of decode**. A 2.6×
+on a 5% region is a 1-2% real-world win. The actual 70% of decode
+is in MLP (`mlp_gate_up` 42.5% + `mlp_down` 27.7%). Pool BF16 was
+the right substrate move; **lm_head was the wrong target.** The
+v0.0.8 lever-1 retarget is "pool the MLP BF16 matmuls" with the
+same Pool.matmulBF16Auto dispatch.
+
+**Baseline drift catch:** v0.0.6 STATUS quoted 581 ms/tok as the
+v0.0.5 baseline. Clean-machine measurement here gets 349 ms/tok.
+Either the 581 number was at higher load than tagged, or the
+baseline drifted with the kv_cache repair. The 200 ms/tok target
+is 1.75× away from clean baseline, not 2.9× away.
+
+**What v0.0.7 shipped:**
+- Per-region Instrumentation in Model.forward (12 regions, env-gated)
+- Pool.matmulBF16Auto (row-split when M >= n_workers, else col-split)
+- 6 new benches (forward-regions, bf16-auto, bf16-cblas, bf16-preconvert, mlp-cblas, tinyllama-breakdown)
+- Tests: 81 pass (77 + 4 new Pool.matmulBF16Auto correctness tests)
 
 ## 2026-05-29 -- BENCH.md landed; BF16 lm_head Type-1 framing corrected
 
