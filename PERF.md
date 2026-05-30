@@ -82,9 +82,11 @@ Documented so future sessions do not re-attempt without new evidence:
 | Lever | Verdict | exp ID | Mechanism |
 |---|---|---|---|
 | 6 — manual `@prefetch` | refuted (2x regression) | exp-1780108992-833810307 | Fights Ice Lake L2 hardware streamer, L1 thrashing across 4 worker threads |
-| 7 — pooled lm_head re-test | inconclusive | exp-1780109335-555121691 | lm_head region improved 3.7pct but other regions regressed 17-24pct; net variance-dominated |
-| 7 alt — VLLM_N_THREADS=8 re-test | refuted (+1.8pct worse) | exp-1780109647-402094155 | Futex sync overhead per dispatch scales with worker count |
+| 7 — pooled lm_head at lever-5 | inconclusive (superseded by 10b) | exp-1780109335-555121691 | At lever-5 row-major: lm_head improved 3.7pct, others regressed 17-24pct. Lever-9 layout FLIPS this positive (see 10b confirmed) |
+| 7 alt — VLLM_N_THREADS=8 at lever-5 | refuted (+1.8pct worse) | exp-1780109647-402094155 | Futex sync overhead per dispatch scales with worker count |
 | 8 — N_TILE=128 (8 ZMM acc) | refuted (+25pct p90, +10pct mlp_gate_up) | exp-1780109796-369194807 | Ice Lake L1 read-port bandwidth (2 loads/cycle) is the limit, not ZMM count |
+| 10a — VLLM_N_THREADS=8 at lever-9 | refuted (+9.8pct worse) | exp-1780111504-034388283 | Same as n=8 at lever-5; n=4 is robust across kernel regimes |
+| 10c — VLLM_N_THREADS=1 at lever-9 | refuted (+77pct worse) | exp-1780112127-728659518 | Multi-thread pool gives ~1.8x effective speedup per-region via memory-level parallelism (4 outstanding DRAM requests overlap latency), even though isolated microbench shows per-call bandwidth saturation at single-thread |
 
 ## What is NOT measured
 
@@ -104,5 +106,11 @@ Cold-start time. Model load is 35 to 99 seconds (varies with system load and BF1
 | "manual @prefetch helps inner K loop" | 2x regression | exp-1780108992-833810307 |
 | "8 threads beats 4 with lever-5" | 1.8pct worse | exp-1780109647-402094155 |
 | "N_TILE=128 doubles register block win" | wash, +25pct p90 | exp-1780109796-369194807 |
+| "Single-thread microbench bandwidth ceiling = no multi-thread gain" | n=4 beats n=1 by 1.77x end-to-end | exp-1780112127-728659518 |
+| "lm_head pool wins" (re-test under lever-9) | actually CONFIRMED at +17.4pct | exp-1780111629-832205672 |
 
 The measurement substrate (per-region instrumentation + load-tagged readings + pre-registered falsifiers) is the load-bearing artifact. Numbers without conditions are not numbers.
+
+**Substrate insight from refuted-then-flipped lm_head pool:** A Type-I catch under one kernel regime can RE-FLIP positive under a different regime. Don't extend a refute past its tested conditions — re-run when the surrounding stack changes meaningfully.
+
+**Substrate insight from microbench misreading:** Isolated per-call bandwidth microbenchmarks do NOT predict end-to-end multi-thread scaling. At single-thread the kernel hits DRAM bandwidth limit; at multi-thread the memory-level parallelism (4 outstanding DRAM requests vs 1) overlaps latency for an additional ~1.8x effective speedup, even though aggregate bandwidth is similar.
