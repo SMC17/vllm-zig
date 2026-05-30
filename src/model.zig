@@ -207,6 +207,15 @@ pub const LayerWeights = struct {
     /// silu_mul. Eliminates one pool wake/wait round-trip per layer and lets
     /// the cache prefetcher work across the contiguous concatenated B-matrix.
     w_gateup_bf16: ?weights_mod.RawBF16 = null,
+    /// Optional FUSED raw BF16 storage holding [w_q | w_k | w_v] concatenated
+    /// horizontally as a single [hidden, q_dim + 2 * kv_dim] matrix. When this
+    /// field is populated (loadFromSafeTensorsOpts with fuse_qkv = true),
+    /// forward dispatches ONE pool.matmulBF16Auto producing the fused
+    /// [seq, q_dim + 2 * kv_dim] result, then splits it into Q / K / V
+    /// before RoPE. Halves the attention BF16 pool dispatches per layer
+    /// (3 -> 1) and lets the cache prefetcher work across the contiguous
+    /// QKV B-matrix.
+    w_qkv_bf16: ?weights_mod.RawBF16 = null,
     /// Optional raw BF16 copies of the attention projections, parallel
     /// to the MLP fields. Populated when LoadOpts.load_attn_bf16 = true.
     /// Used by the v0.0.8 lever-2 attention-pool dispatch path.
@@ -229,6 +238,7 @@ pub const LayerWeights = struct {
         if (self.w_up_bf16) |*b| b.deinit(alloc);
         if (self.w_down_bf16) |*b| b.deinit(alloc);
         if (self.w_gateup_bf16) |*b| b.deinit(alloc);
+        if (self.w_qkv_bf16) |*b| b.deinit(alloc);
         if (self.w_q_bf16) |*b| b.deinit(alloc);
         if (self.w_k_bf16) |*b| b.deinit(alloc);
         if (self.w_v_bf16) |*b| b.deinit(alloc);
@@ -251,6 +261,12 @@ pub const LoadOpts = struct {
     /// gate+up path. Same total memory as load_mlp_bf16 alone (the fused
     /// matrix replaces the two separates).
     fuse_mlp_gate_up: bool = false,
+    /// When true (and load_attn_bf16 is also true), pack Q, K, V projections
+    /// into a single fused w_qkv_bf16 [hidden, q_dim + 2 * kv_dim] matrix
+    /// and SKIP allocating the separate w_q_bf16 / w_k_bf16 / w_v_bf16
+    /// fields. forward() dispatches ONE matmul instead of three for the
+    /// QKV path. Same total memory as load_attn_bf16 alone.
+    fuse_qkv: bool = false,
     /// When true, also load raw BF16 copies of the attention projections
     /// (w_q / w_k / w_v / w_o) into the parallel _bf16 LayerWeights
     /// fields. The pool.matmulBF16Auto dispatch reads these on the
@@ -433,9 +449,22 @@ pub const Model = struct {
                 layers[i].w_down_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.down_proj.weight", .{i}));
             }
             if (opts.load_attn_bf16) {
-                layers[i].w_q_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i}));
-                layers[i].w_k_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i}));
-                layers[i].w_v_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i}));
+                if (opts.fuse_qkv) {
+                    // QKV fusion: concat Q | K | V columns into a single
+                    // [hidden, q_dim + 2 * kv_dim] BF16 matrix. forward()
+                    // dispatches one matmul instead of three; split before
+                    // RoPE. Same lever as gate+up fusion (v0.0.8 lever-3).
+                    const q_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i});
+                    var k_name_buf: [256]u8 = undefined;
+                    const k_name = try std.fmt.bufPrint(&k_name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i});
+                    var v_name_buf: [256]u8 = undefined;
+                    const v_name = try std.fmt.bufPrint(&v_name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i});
+                    layers[i].w_qkv_bf16 = try weights_mod.loadMatrixBF16RawConcat3Transposed(alloc, st, q_name, k_name, v_name);
+                } else {
+                    layers[i].w_q_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i}));
+                    layers[i].w_k_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i}));
+                    layers[i].w_v_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i}));
+                }
                 layers[i].w_o_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{i}));
             }
         }
@@ -522,25 +551,66 @@ pub const Model = struct {
             // set AND a pool is attached AND BF16 mirror weights are loaded,
             // dispatch through pool.matmulBF16Auto. Otherwise fall through
             // to the existing F32 matmulDispatch path.
-            const attn_bf16 = self.use_pooled_bf16_attn and self.pool != null and layer.w_q_bf16 != null and layer.w_k_bf16 != null and layer.w_v_bf16 != null and layer.w_o_bf16 != null;
+            //
+            // QKV fusion (v0.0.9 lever-4, LoadOpts.fuse_qkv): when
+            // w_qkv_bf16 is populated, dispatch ONE matmul against the
+            // concatenated [W_q | W_k | W_v] producing a [seq, q_dim + 2 * kv_dim]
+            // output, then slice into Q / K / V before RoPE. Eliminates
+            // two pool wake/wait round-trips per layer.
+            const attn_bf16 = self.use_pooled_bf16_attn and self.pool != null and ((layer.w_qkv_bf16 != null) or (layer.w_q_bf16 != null and layer.w_k_bf16 != null and layer.w_v_bf16 != null)) and layer.w_o_bf16 != null;
+            const attn_qkv_fused = self.use_pooled_bf16_attn and self.pool != null and layer.w_qkv_bf16 != null and layer.w_o_bf16 != null;
             const t_qkv_start = if (inst != null) nowNs() else 0;
-            var q = try Matrix.init(alloc, seq, q_dim);
-            defer q.deinit(alloc);
-            var k = try Matrix.init(alloc, seq, kv_dim);
-            defer k.deinit(alloc);
-            var v = try Matrix.init(alloc, seq, kv_dim);
-            defer v.deinit(alloc);
-            if (attn_bf16) {
+
+            // Fused path uses one [seq, q_dim + 2 * kv_dim] matrix and
+            // produces Q / K / V views onto it. Split paths allocate
+            // q / k / v separately.
+            const fused_qkv_cols: usize = q_dim + 2 * kv_dim;
+            var qkv_buf: ?Matrix = if (attn_qkv_fused) try Matrix.init(alloc, seq, fused_qkv_cols) else null;
+            defer if (qkv_buf) |*qb| qb.deinit(alloc);
+            var q_buf: ?Matrix = if (!attn_qkv_fused) try Matrix.init(alloc, seq, q_dim) else null;
+            defer if (q_buf) |*qb| qb.deinit(alloc);
+            var k_buf: ?Matrix = if (!attn_qkv_fused) try Matrix.init(alloc, seq, kv_dim) else null;
+            defer if (k_buf) |*kb| kb.deinit(alloc);
+            var v_buf: ?Matrix = if (!attn_qkv_fused) try Matrix.init(alloc, seq, kv_dim) else null;
+            defer if (v_buf) |*vb| vb.deinit(alloc);
+
+            if (attn_qkv_fused) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&x, layer.w_q_bf16.?.data, layer.w_q_bf16.?.rows, layer.w_q_bf16.?.cols, &q, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_k_bf16.?.data, layer.w_k_bf16.?.rows, layer.w_k_bf16.?.cols, &k, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_v_bf16.?.data, layer.w_v_bf16.?.rows, layer.w_v_bf16.?.cols, &v, self.n_threads);
+                const qkvw = layer.w_qkv_bf16.?;
+                try p.matmulBF16Auto(&x, qkvw.data, qkvw.rows, qkvw.cols, &qkv_buf.?, self.n_threads);
+            } else if (attn_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&x, layer.w_q_bf16.?.data, layer.w_q_bf16.?.rows, layer.w_q_bf16.?.cols, &q_buf.?, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_k_bf16.?.data, layer.w_k_bf16.?.rows, layer.w_k_bf16.?.cols, &k_buf.?, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_v_bf16.?.data, layer.w_v_bf16.?.rows, layer.w_v_bf16.?.cols, &v_buf.?, self.n_threads);
             } else {
-                try self.matmulDispatch(&x, &layer.w_q, &q);
-                try self.matmulDispatch(&x, &layer.w_k, &k);
-                try self.matmulDispatch(&x, &layer.w_v, &v);
+                try self.matmulDispatch(&x, &layer.w_q, &q_buf.?);
+                try self.matmulDispatch(&x, &layer.w_k, &k_buf.?);
+                try self.matmulDispatch(&x, &layer.w_v, &v_buf.?);
             }
             if (inst) |ip| ip.add(.qkv_proj, nowNs() - t_qkv_start);
+
+            // RoPE needs []f32 slices over Q and K. In the fused path we
+            // construct non-owning Matrix views onto qkv_buf so the rest
+            // of the attention block can consume them identically.
+            const q_slice_total = seq * q_dim;
+            const k_slice_total = seq * kv_dim;
+            const v_slice_total = seq * kv_dim;
+            const q: Matrix = if (attn_qkv_fused) .{
+                .rows = seq,
+                .cols = q_dim,
+                .data = qkv_buf.?.data[0..q_slice_total],
+            } else q_buf.?;
+            const k: Matrix = if (attn_qkv_fused) .{
+                .rows = seq,
+                .cols = kv_dim,
+                .data = qkv_buf.?.data[q_slice_total .. q_slice_total + k_slice_total],
+            } else k_buf.?;
+            const v: Matrix = if (attn_qkv_fused) .{
+                .rows = seq,
+                .cols = kv_dim,
+                .data = qkv_buf.?.data[q_slice_total + k_slice_total .. q_slice_total + k_slice_total + v_slice_total],
+            } else v_buf.?;
 
             // RoPE on Q and K
             const t_rope_start = if (inst != null) nowNs() else 0;

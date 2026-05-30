@@ -244,6 +244,51 @@ pub fn loadMatrixBF16RawConcatTransposed(
     return .{ .data = out, .rows = K, .cols = 2 * N };
 }
 
+/// Load three BF16 matrices (Q, K, V attention projections) and produce
+/// a single fused [in_features, q_cols + k_cols + v_cols] raw BF16
+/// matrix where each input-feature row holds [q_row | k_row | v_row]
+/// concatenated horizontally. Used by the v0.0.9 QKV fusion path so
+/// forward() can dispatch one matmul instead of three against the same
+/// input x. The three source matrices must share their input-feature
+/// dim K (their .rows after transpose). Output layout matches
+/// matmul_bf16.matmulBF16SIMD's expectations: rows = K, cols = sum of
+/// per-source cols.
+pub fn loadMatrixBF16RawConcat3Transposed(
+    alloc: std.mem.Allocator,
+    st: *safetensors.SafeTensors,
+    q_name: []const u8,
+    k_name: []const u8,
+    v_name: []const u8,
+) !RawBF16 {
+    var q = try loadMatrixBF16RawTransposed(alloc, st, q_name);
+    defer alloc.free(q.data);
+    var k = try loadMatrixBF16RawTransposed(alloc, st, k_name);
+    defer alloc.free(k.data);
+    var v = try loadMatrixBF16RawTransposed(alloc, st, v_name);
+    defer alloc.free(v.data);
+
+    if (q.rows != k.rows or q.rows != v.rows) return Error.DimensionMismatch;
+
+    const K_dim = q.rows;
+    const q_cols = q.cols;
+    const k_cols = k.cols;
+    const v_cols = v.cols;
+    const total_cols = q_cols + k_cols + v_cols;
+    const out = try alloc.alloc(u16, K_dim * total_cols);
+    errdefer alloc.free(out);
+    var row: usize = 0;
+    while (row < K_dim) : (row += 1) {
+        const q_src = q.data[row * q_cols ..][0..q_cols];
+        const k_src = k.data[row * k_cols ..][0..k_cols];
+        const v_src = v.data[row * v_cols ..][0..v_cols];
+        const dst_base = row * total_cols;
+        @memcpy(out[dst_base..][0..q_cols], q_src);
+        @memcpy(out[dst_base + q_cols ..][0..k_cols], k_src);
+        @memcpy(out[dst_base + q_cols + k_cols ..][0..v_cols], v_src);
+    }
+    return .{ .data = out, .rows = K_dim, .cols = total_cols };
+}
+
 /// Convenience: load a matrix and transpose it. HF stores attention
 /// projection weights in [out_features, in_features] layout, but our
 /// matmul expects [in_features, out_features] (so x @ W = result where
