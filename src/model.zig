@@ -376,7 +376,9 @@ pub const Model = struct {
     }
 
     /// Dispatch a pooled BF16 matmul through the layout-appropriate pool
-    /// method (row-major matmulBF16Auto or lever-9 matmulBF16NtileMajorAuto).
+    /// method. When ntile-major is enabled, prefill (M >= 4) routes
+    /// through matmulBF16BlockedAuto (lever-12 GEMM substrate) and
+    /// decode (M < 4) through matmulBF16NtileMajorAuto (lever-9).
     inline fn dispatchBF16(
         self: *const Model,
         p: *thread_pool.Pool,
@@ -387,7 +389,7 @@ pub const Model = struct {
         c: *Matrix,
     ) thread_pool.Error!void {
         if (self.use_bf16_ntile_major) {
-            return p.matmulBF16NtileMajorAuto(a, b, b_rows, b_cols, c, self.n_threads);
+            return p.matmulBF16BlockedAuto(a, b, b_rows, b_cols, c, self.n_threads);
         }
         return p.matmulBF16Auto(a, b, b_rows, b_cols, c, self.n_threads);
     }

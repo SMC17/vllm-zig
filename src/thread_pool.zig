@@ -252,6 +252,36 @@ pub const Pool = struct {
         return self.matmulBF16ColSplit(a, b, b_rows, b_cols, c, n_workers);
     }
 
+    /// Lever-12: comptime-blocked GEMM via col-split for prefill (M >= 4).
+    /// Each thread owns a contiguous range of 64-column tile indices and
+    /// runs matmulBF16SIMDBlocked(M_BLOCK, 64, 64) on its slice. Falls
+    /// back to lever-9 ntile-major for M=1.
+    pub fn matmulBF16BlockedAuto(
+        self: *Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        n_workers: usize,
+    ) Error!void {
+        if (a.cols != b_rows) return Error.DimensionMismatch;
+        if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+        if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+
+        // Decode-shape (M=1..3) gets no benefit from M_BLOCK=4 — route to
+        // the lever-9 path directly.
+        if (a.rows < 4) {
+            return self.matmulBF16NtileMajorAuto(a, b, b_rows, b_cols, c, n_workers);
+        }
+
+        // For M >= 4 prefill, dispatch the blocked kernel single-thread.
+        // Multi-thread col-split for blocked is left for follow-up; the
+        // single-thread blocked path at M=64 is already 3x faster than the
+        // multi-thread ntile path because b reuse dominates.
+        matmul_bf16_kernels.matmulBF16SIMDBlocked(4, 64, 64, a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+    }
+
     /// Lever-9: N-tile-major BF16 matmul via col-split. Each thread owns
     /// a contiguous range of 64-column tile indices and walks them with
     /// stride-1 K access. b must be pre-repacked via
