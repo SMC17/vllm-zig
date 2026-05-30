@@ -162,6 +162,24 @@ pub fn build(b: *std.Build) void {
     bench_ktile_step.dependOn(&run_bench_ktile.step);
 
     // ------------------------------------------------------------------
+    // bench-bf16-mblock-sweep — M_BLOCK sweep across M={8,16,32,64}
+    // ------------------------------------------------------------------
+    const bench_mblock_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_bf16_mblock_sweep.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mblock_mod.addImport("vllm", mod_fast);
+    const bench_mblock_exe = b.addExecutable(.{
+        .name = "bench-bf16-mblock-sweep",
+        .root_module = bench_mblock_mod,
+    });
+    const run_bench_mblock = b.addRunArtifact(bench_mblock_exe);
+    run_bench_mblock.has_side_effects = true;
+    const bench_mblock_step = b.step("bench-bf16-mblock-sweep", "M_BLOCK sweep on lever-12 blocked GEMM");
+    bench_mblock_step.dependOn(&run_bench_mblock.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{
