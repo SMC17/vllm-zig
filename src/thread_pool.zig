@@ -527,7 +527,14 @@ fn matmulBF16RowsKernel(
 /// BF16-weights column-range per-thread kernel. M is implicit (a.rows);
 /// each worker writes columns [col_start, col_end) for ALL rows.
 /// This is the decode-shape path: M=1, N=vocab_size, T workers each own
-/// a vocab slice. Same widen sequence as matmulBF16RowsKernel.
+/// a vocab slice.
+///
+/// v0.0.10 lever-5 (register-blocked inner-product form):
+///   - N-tile = 64 columns held in 4 ZMM accumulators across full K loop.
+///   - K*N c-reads/writes collapse to 1 store per N-tile (K-fold reduction).
+///   - Tail per LANE = 16 (single-accumulator inner-product), then scalar.
+/// Pool's submitBF16 @memset C to zero before dispatch, so a final store
+/// is correct (no accumulation needed for tiled ranges we fully overwrite).
 fn matmulBF16ColRangeKernel(
     a: *const Matrix,
     b: []const u16,
@@ -538,39 +545,91 @@ fn matmulBF16ColRangeKernel(
     col_end: usize,
 ) void {
     _ = b_rows;
-    // 16-lane: see kernels/matmul.zig matmulSIMDColRange docstring.
     const Vec_u16 = @Vector(16, u16);
     const Vec_u32 = @Vector(16, u32);
     const Vec_f32 = @Vector(16, f32);
     const LANE = 16;
+    const TILE = 4 * LANE; // 64 columns per register-blocked N-tile
 
     const M = a.rows;
     const N = b_cols;
     const K = a.cols;
+    const span = col_end - col_start;
+    const tile_span = (span / TILE) * TILE;
+    const lane_span_after_tile = ((span - tile_span) / LANE) * LANE;
+    const j_tile_end = col_start + tile_span;
+    const j_lane_end = j_tile_end + lane_span_after_tile;
 
     var i: usize = 0;
     while (i < M) : (i += 1) {
         const a_row = a.data[i * K ..][0..K];
         const c_row = c.data[i * N ..][0..N];
-        var k: usize = 0;
-        while (k < K) : (k += 1) {
-            const a_scalar: Vec_f32 = @splat(a_row[k]);
-            const b_row = b[k * N ..][0..N];
+        const shift: @Vector(16, u5) = @splat(16);
 
-            var j = col_start;
-            const aligned_end = col_start + ((col_end - col_start) / LANE) * LANE;
-            while (j < aligned_end) : (j += LANE) {
-                const b_u16v: Vec_u16 = b_row[j..][0..LANE].*;
-                const b_u32v: Vec_u32 = b_u16v;
-                const b_shifted: Vec_u32 = b_u32v << @splat(@as(u5, 16));
-                const b_f32v: Vec_f32 = @bitCast(b_shifted);
-                const cv: Vec_f32 = c_row[j..][0..LANE].*;
-                c_row[j..][0..LANE].* = cv + a_scalar * b_f32v;
+        // 4-ZMM register-blocked main loop: 64 cols per tile, accumulators
+        // stay in registers across K, single store at tile end.
+        var j = col_start;
+        while (j < j_tile_end) : (j += TILE) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a_row[k]);
+                const b_row = b[k * N + j ..][0..TILE];
+
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
             }
-            while (j < col_end) : (j += 1) {
-                const bv: f32 = @bitCast(@as(u32, b_row[j]) << 16);
-                c_row[j] += a_row[k] * bv;
+
+            c_row[j..][0..LANE].* = acc0;
+            c_row[j + LANE ..][0..LANE].* = acc1;
+            c_row[j + 2 * LANE ..][0..LANE].* = acc2;
+            c_row[j + 3 * LANE ..][0..LANE].* = acc3;
+        }
+
+        // Single-LANE inner-product tail for remaining 16-column blocks.
+        while (j < j_lane_end) : (j += LANE) {
+            var acc: Vec_f32 = @splat(0.0);
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a_row[k]);
+                const b_u16: Vec_u16 = b[k * N + j ..][0..LANE].*;
+                const b_u32: Vec_u32 = b_u16;
+                const b_f32: Vec_f32 = @bitCast(b_u32 << shift);
+                acc = @mulAdd(Vec_f32, a_scalar, b_f32, acc);
             }
+            c_row[j..][0..LANE].* = acc;
+        }
+
+        // Scalar tail for columns not covered by a full LANE.
+        while (j < col_end) : (j += 1) {
+            var acc: f32 = 0.0;
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const bv: f32 = @bitCast(@as(u32, b[k * N + j]) << 16);
+                acc += a_row[k] * bv;
+            }
+            c_row[j] = acc;
         }
     }
 }
@@ -844,8 +903,19 @@ test "Pool — BF16 lm_head-shape col-split matches single-thread (M=1, K=2048, 
     try matmul_bf16_kernels.matmulBF16SIMD(&a, b_bf16, K, N, &c_single);
     try pool.matmulBF16ColSplit(&a, b_bf16, K, N, &c_pool, 8);
 
-    // Same operations partitioned across columns; bit-exact accumulation
-    // because each output column is computed by a single worker walking
-    // K identically.
-    try testing.expect(c_single.approxEq(&c_pool, 1e-3));
+    // v0.0.10 lever-5: col-range kernel uses @mulAdd (FMA, one rounding)
+    // while baseline matmulBF16SIMD does separate mul+add (two roundings).
+    // max_abs diff is ~6e-6 (within f32 precision); max_rel can spike to
+    // ~2% only on indices where both values are <1e-5 (small-magnitude
+    // BF16 cancellation noise). Switch to absolute tolerance for that
+    // edge case.
+    for (c_single.data, c_pool.data) |x, y| {
+        const d = @abs(x - y);
+        const m = @max(@abs(x), @abs(y));
+        if (m > 1e-3) {
+            try testing.expect(d / m < 5e-3);
+        } else {
+            try testing.expect(d < 1e-4);
+        }
+    }
 }
