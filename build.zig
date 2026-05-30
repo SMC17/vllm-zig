@@ -108,6 +108,24 @@ pub fn build(b: *std.Build) void {
     bench_ntile_step.dependOn(&run_bench_ntile.step);
 
     // ------------------------------------------------------------------
+    // bench-bf16-ntile-shapes — lever-9 win across all TinyLlama shapes
+    // ------------------------------------------------------------------
+    const bench_ntile_shapes_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_bf16_ntile_shapes.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_ntile_shapes_mod.addImport("vllm", mod_fast);
+    const bench_ntile_shapes_exe = b.addExecutable(.{
+        .name = "bench-bf16-ntile-shapes",
+        .root_module = bench_ntile_shapes_mod,
+    });
+    const run_bench_ntile_shapes = b.addRunArtifact(bench_ntile_shapes_exe);
+    run_bench_ntile_shapes.has_side_effects = true;
+    const bench_ntile_shapes_step = b.step("bench-bf16-ntile-shapes", "Lever-9 win across all five TinyLlama BF16 matmul shapes");
+    bench_ntile_shapes_step.dependOn(&run_bench_ntile_shapes.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{
