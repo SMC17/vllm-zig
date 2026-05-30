@@ -126,6 +126,24 @@ pub fn build(b: *std.Build) void {
     bench_ntile_shapes_step.dependOn(&run_bench_ntile_shapes.step);
 
     // ------------------------------------------------------------------
+    // bench-bf16-blocked — lever-12 substrate (M-block + K-tile + N-tile)
+    // ------------------------------------------------------------------
+    const bench_blocked_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_bf16_blocked.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_blocked_mod.addImport("vllm", mod_fast);
+    const bench_blocked_exe = b.addExecutable(.{
+        .name = "bench-bf16-blocked",
+        .root_module = bench_blocked_mod,
+    });
+    const run_bench_blocked = b.addRunArtifact(bench_blocked_exe);
+    run_bench_blocked.has_side_effects = true;
+    const bench_blocked_step = b.step("bench-bf16-blocked", "Lever-12 comptime-blocked GEMM substrate at decode + prefill shapes");
+    bench_blocked_step.dependOn(&run_bench_blocked.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{

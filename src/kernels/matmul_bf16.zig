@@ -419,6 +419,186 @@ pub fn matmulBF16SIMDNtileMajor(
     }
 }
 
+/// Comptime-blocked BF16 GEMM kernel (substrate primitive).
+///
+/// Parameterised on M_BLOCK (rows accumulated together), N_TILE (cols per
+/// inner register tile, must equal 64 to match N-tile-major layout), and
+/// K_TILE (rows of B walked in each outer block — cache locality knob).
+///
+/// b layout: N-tile-major, [n_tile_outer, K, n_tile_inner=64], identical
+/// to matmulBF16SIMDNtileMajor's expected input. Caller is responsible
+/// for pre-repacking via weights.repackBF16ToNtileMajor at load time.
+///
+/// Schedule (BLAS-style 2-level blocking):
+///
+///   for n_tile in 0..N/64:
+///     accs[M_BLOCK][4] = 0           // M_BLOCK rows x 4 ZMM tiles
+///     for k_tile in 0..K step K_TILE:
+///       for k in k_tile..k_tile+K_TILE:
+///         load b[n_tile][k][0..64]   // 4 ZMM b loads (shared across M)
+///         inline for m in 0..M_BLOCK:
+///           a_scalar = splat(a[m, k])
+///           inline for t in 0..4:
+///             accs[m][t] = fmadd(a_scalar, b[t], accs[m][t])
+///     store c[m_block_start..m_block_start+M_BLOCK, n_tile..n_tile+64]
+///
+/// Each b load is consumed M_BLOCK times before the next b load (b reuse
+/// across M direction). K_TILE controls the inner-loop trip count; smaller
+/// K_TILE = finer-grained scheduling, larger K_TILE = less loop overhead.
+///
+/// Register pressure on Ice Lake AVX-512 (32 ZMM):
+///   M_BLOCK=4 N_TILE=64: 16 acc ZMM + 4 b ZMM + 4 a splats + 1 shift = 25
+///   M_BLOCK=1 N_TILE=64: 4 acc ZMM + 4 b ZMM + 1 a splat + 1 shift = 10
+///
+/// For M=1 (decode) this degenerates to lever-9 plus an explicit K-tile
+/// outer loop — same memory traffic, similar timing. The real win is at
+/// M>=2 (prefill, batched serving) where b loads amortize across M.
+/// Pre-reg exp-1780157294-563607188.
+///
+/// All three parameters are comptime, so the compiler specializes the
+/// kernel per (M_BLOCK, N_TILE, K_TILE) tuple — `inline for` over M_BLOCK
+/// unrolls the M dimension into a flat sequence of fmadds.
+pub fn matmulBF16SIMDBlocked(
+    comptime M_BLOCK: usize,
+    comptime N_TILE: usize,
+    comptime K_TILE: usize,
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+) Error!void {
+    comptime {
+        if (N_TILE != 64) @compileError("matmulBF16SIMDBlocked: N_TILE must be 64 to match N-tile-major weight layout");
+        if (M_BLOCK == 0) @compileError("matmulBF16SIMDBlocked: M_BLOCK must be at least 1");
+        if (K_TILE == 0) @compileError("matmulBF16SIMDBlocked: K_TILE must be at least 1");
+    }
+
+    if (a.cols != b_rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+    if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
+    const TILE = N_TILE;
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+    const n_tiles = N / TILE;
+
+    @memset(c.data, 0.0);
+
+    // M loop in blocks of M_BLOCK. Tail rows (M % M_BLOCK) handled via a
+    // dedicated single-row pass below.
+    const m_block_end = (M / M_BLOCK) * M_BLOCK;
+    var m_base: usize = 0;
+    while (m_base < m_block_end) : (m_base += M_BLOCK) {
+        var nt: usize = 0;
+        while (nt < n_tiles) : (nt += 1) {
+            // M_BLOCK rows × 4 ZMM accumulators each.
+            var accs: [M_BLOCK][4]Vec_f32 = undefined;
+            inline for (0..M_BLOCK) |m| inline for (0..4) |t| {
+                accs[m][t] = @splat(0.0);
+            };
+
+            const tile_base = nt * K * TILE;
+            const shift: @Vector(16, u5) = @splat(16);
+
+            // K-tile outer + K inner. The accumulators stay live across all
+            // k_tile passes (they fit in registers), so K_TILE is purely a
+            // loop-shape knob — useful for icache locality and for the
+            // compiler's scheduling decisions.
+            var k_outer: usize = 0;
+            while (k_outer < K) : (k_outer += K_TILE) {
+                const k_end = @min(k_outer + K_TILE, K);
+                var k = k_outer;
+                while (k < k_end) : (k += 1) {
+                    const b_row = b[tile_base + k * TILE ..][0..TILE];
+                    const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                    const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                    const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                    const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+                    const b0_u32: Vec_u32 = b0_u16;
+                    const b1_u32: Vec_u32 = b1_u16;
+                    const b2_u32: Vec_u32 = b2_u16;
+                    const b3_u32: Vec_u32 = b3_u16;
+                    const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                    const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                    const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                    const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                    // M-block fmadd: b loads above are reused M_BLOCK times.
+                    inline for (0..M_BLOCK) |m| {
+                        const a_scalar: Vec_f32 = @splat(a.data[(m_base + m) * K + k]);
+                        accs[m][0] = @mulAdd(Vec_f32, a_scalar, b0_f32, accs[m][0]);
+                        accs[m][1] = @mulAdd(Vec_f32, a_scalar, b1_f32, accs[m][1]);
+                        accs[m][2] = @mulAdd(Vec_f32, a_scalar, b2_f32, accs[m][2]);
+                        accs[m][3] = @mulAdd(Vec_f32, a_scalar, b3_f32, accs[m][3]);
+                    }
+                }
+            }
+
+            // Store M_BLOCK rows × N_TILE cols.
+            const c_base = nt * TILE;
+            inline for (0..M_BLOCK) |m| {
+                const c_row = c.data[(m_base + m) * N ..][0..N];
+                c_row[c_base..][0..LANE].* = accs[m][0];
+                c_row[c_base + LANE ..][0..LANE].* = accs[m][1];
+                c_row[c_base + 2 * LANE ..][0..LANE].* = accs[m][2];
+                c_row[c_base + 3 * LANE ..][0..LANE].* = accs[m][3];
+            }
+        }
+    }
+
+    // Tail M rows (M % M_BLOCK). Walk one row at a time using the same
+    // schedule with M_BLOCK=1 effectively.
+    while (m_base < M) : (m_base += 1) {
+        var nt: usize = 0;
+        while (nt < n_tiles) : (nt += 1) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+
+            const tile_base = nt * K * TILE;
+            const shift: @Vector(16, u5) = @splat(16);
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a.data[m_base * K + k]);
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
+            }
+
+            const c_base = nt * TILE;
+            const c_row = c.data[m_base * N ..][0..N];
+            c_row[c_base..][0..LANE].* = acc0;
+            c_row[c_base + LANE ..][0..LANE].* = acc1;
+            c_row[c_base + 2 * LANE ..][0..LANE].* = acc2;
+            c_row[c_base + 3 * LANE ..][0..LANE].* = acc3;
+        }
+    }
+}
+
 /// Auto-dispatch BF16-weights matmul.
 ///
 /// On macOS (Apple Silicon), routes B-matrices with ≥1M elements through
@@ -601,6 +781,91 @@ test "matmulBF16SIMDRegBlock — tail handling (N=77 not multiple of 64 or 16)" 
     try matmulBF16SIMDRegBlock(&a, b_bf16, K, N, &c_regblock);
 
     try testing.expect(c_simd.approxEq(&c_regblock, 5e-4));
+}
+
+test "matmulBF16SIMDBlocked M=4 N_TILE=64 K_TILE=128 — agrees with NtileMajor on prefill shape" {
+    const M: usize = 4;
+    const K: usize = 128;
+    const N: usize = 256;
+
+    var a = try Matrix.init(testing.allocator, M, K);
+    defer a.deinit(testing.allocator);
+    var b_f32 = try Matrix.init(testing.allocator, K, N);
+    defer b_f32.deinit(testing.allocator);
+    a.fillRandom(71);
+    b_f32.fillRandom(73);
+
+    const b_rm = try matrixToBF16(testing.allocator, &b_f32);
+    defer testing.allocator.free(b_rm);
+
+    // Repack to N-tile-major (same layout the blocked kernel consumes).
+    const TILE: usize = 64;
+    const n_tiles = N / TILE;
+    const b_nt = try testing.allocator.alloc(u16, K * N);
+    defer testing.allocator.free(b_nt);
+    var nt: usize = 0;
+    while (nt < n_tiles) : (nt += 1) {
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var i: usize = 0;
+            while (i < TILE) : (i += 1) {
+                b_nt[nt * K * TILE + k * TILE + i] = b_rm[k * N + nt * TILE + i];
+            }
+        }
+    }
+
+    var c_ntile = try Matrix.init(testing.allocator, M, N);
+    defer c_ntile.deinit(testing.allocator);
+    var c_blocked = try Matrix.init(testing.allocator, M, N);
+    defer c_blocked.deinit(testing.allocator);
+
+    try matmulBF16SIMDNtileMajor(&a, b_nt, K, N, &c_ntile);
+    try matmulBF16SIMDBlocked(4, 64, 128, &a, b_nt, K, N, &c_blocked);
+
+    // Both kernels use FMA so accumulation rounding matches; tolerance
+    // covers BF16 quantization noise across K=128.
+    try testing.expect(c_ntile.approxEq(&c_blocked, 5e-3));
+}
+
+test "matmulBF16SIMDBlocked M_BLOCK=1 — equivalent to matmulBF16SIMDNtileMajor on M=1" {
+    const M: usize = 1;
+    const K: usize = 256;
+    const N: usize = 128;
+
+    var a = try Matrix.init(testing.allocator, M, K);
+    defer a.deinit(testing.allocator);
+    var b_f32 = try Matrix.init(testing.allocator, K, N);
+    defer b_f32.deinit(testing.allocator);
+    a.fillRandom(81);
+    b_f32.fillRandom(83);
+
+    const b_rm = try matrixToBF16(testing.allocator, &b_f32);
+    defer testing.allocator.free(b_rm);
+
+    const TILE: usize = 64;
+    const n_tiles = N / TILE;
+    const b_nt = try testing.allocator.alloc(u16, K * N);
+    defer testing.allocator.free(b_nt);
+    var nt: usize = 0;
+    while (nt < n_tiles) : (nt += 1) {
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var i: usize = 0;
+            while (i < TILE) : (i += 1) {
+                b_nt[nt * K * TILE + k * TILE + i] = b_rm[k * N + nt * TILE + i];
+            }
+        }
+    }
+
+    var c_ntile = try Matrix.init(testing.allocator, M, N);
+    defer c_ntile.deinit(testing.allocator);
+    var c_blocked = try Matrix.init(testing.allocator, M, N);
+    defer c_blocked.deinit(testing.allocator);
+
+    try matmulBF16SIMDNtileMajor(&a, b_nt, K, N, &c_ntile);
+    try matmulBF16SIMDBlocked(1, 64, 64, &a, b_nt, K, N, &c_blocked);
+
+    try testing.expect(c_ntile.approxEq(&c_blocked, 5e-3));
 }
 
 test "matmulBF16 — dimension mismatch is caught" {
