@@ -90,6 +90,24 @@ pub fn build(b: *std.Build) void {
     bench_pool_step.dependOn(&run_bench_pool.step);
 
     // ------------------------------------------------------------------
+    // bench-bf16-ntile-major — lever-9 layout vs lever-5 microbench
+    // ------------------------------------------------------------------
+    const bench_ntile_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_bf16_ntile_major.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_ntile_mod.addImport("vllm", mod_fast);
+    const bench_ntile_exe = b.addExecutable(.{
+        .name = "bench-bf16-ntile-major",
+        .root_module = bench_ntile_mod,
+    });
+    const run_bench_ntile = b.addRunArtifact(bench_ntile_exe);
+    run_bench_ntile.has_side_effects = true;
+    const bench_ntile_step = b.step("bench-bf16-ntile-major", "Lever-9 N-tile-major BF16 layout microbench");
+    bench_ntile_step.dependOn(&run_bench_ntile.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{
