@@ -1,11 +1,19 @@
-# BENCH -- vllm-zig perf measurement methodology + v0.0.6 results
+# BENCH -- vllm-zig perf measurement methodology
 
-**Status:** in-progress, internal substrate work
-**Date:** 2026-05-29
+**Status:** measurement substrate (load-tagged + pre-registered + falsified)
+**Original date:** 2026-05-29
 **Author:** Sean Collins
-**Repo:** vllm-zig @ v0.0.6
-**Audience:** the next time anyone (including me) tries to claim a
-v0.0.6 perf number, this is the document they read first.
+**Audience:** anyone about to claim a perf number reads this first.
+
+**Current numbers live in [PERF.md](PERF.md), not here.** This document
+records the METHODOLOGY: how to read load-tagged measurements, how to
+avoid Type-I catches like the v0.0.6 case below, and how to A/B-toggle
+properly. The v0.0.6 case is the founding worked example.
+
+For current state see PERF.md: v0.0.11 lever-9 + lm_head pool at clean-load
+median **100 ms-per-tok**, **6.17x** cumulative from v0.0.9 lever-4
+baseline. Confirmed by 4 wins + 6 refuted attempts (Type-I prevention
+substrate table in PERF.md).
 
 ---
 
