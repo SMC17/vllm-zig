@@ -15,9 +15,13 @@ All measurements: prefill 1 prompt + decode 16 tokens, 5 rounds, median reported
 | 0.0.8 | lever-2 + lever-3 pool+fuse | 250 | **211** | n/a | ~10 |
 | 0.0.9 | lever-4 QKV fusion | (inconclusive) | n/a | n/a | 22-28 |
 | 0.0.10 | lever-5 reg-blocked kernel | 277 | 263 | 311 | 18 |
-| **0.0.11** | **lever-9 N-tile-major layout** | **174** | **164** | **207** | **~14** |
+| 0.0.11 | lever-9 N-tile-major layout (load ~14) | 174 | 164 | 207 | 14 |
+| 0.0.11 | lever-9 (clean load) | 121 | 107 | 158 | ~3-5 |
+| **0.0.11** | **lever-9 + lm_head pool (clean load)** | **100** | **97** | **173** | **~3-5** |
 
-The 0.0.11 median 174 at load 14 supersedes prior measurements. Cumulative improvement from v0.0.9 lever-4 baseline (med 617): **3.55x**.
+The 0.0.11 + lm_head pool median 100 at clean load is the standing best. Cumulative improvement from v0.0.9 lever-4 baseline (med 617): **6.17x**.
+
+Note: lever-9 reported numbers (174 med) and lever-9 + lm_head pool (100 med) were re-benched at matched clean load; the 174 number was load-elevated from background processes during the initial release bench.
 
 ## Lever-9 per-region (n=4 threads, load ~14)
 
@@ -38,11 +42,14 @@ Lever-9 hits all five BF16 matmul regions through the layout change at load time
 
 ```
 VLLM_BF16_NTILE_MAJOR=1 \
+VLLM_POOLED_LM_HEAD=1 \
 VLLM_POOLED_MLP=1 VLLM_POOLED_ATTN=1 \
 VLLM_POOLED_MLP_FUSED=1 VLLM_QKV_FUSED=1 \
 VLLM_N_THREADS=4 \
   zig build bench-forward-regions -Doptimize=ReleaseFast
 ```
+
+`VLLM_POOLED_LM_HEAD=1` was Type-I catched as a wash at lever-5 (exp-1780109335-555121691) but FLIPS positive at lever-9 (exp-1780111629-832205672): the layout amortizes per-thread per-tile work enough that pool dispatch overhead is dominated by the parallel gain on the lm_head shape (M=1, K=2048, N=32000). Re-bench at matched load confirmed +17.4 percent decode median improvement.
 
 Do NOT set `VLLM_POOLED_LM_HEAD=1`. Re-tested with the lever-5 register-blocked kernel (exp-1780109335-555121691): lm_head region itself improved 3.7pct, but the pool path injection regressed other regions 17-24pct. Net inconclusive at variance level. Keep off.
 

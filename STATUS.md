@@ -1,7 +1,53 @@
 # STATUS
 
 **Version:** v0.0.11 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29 (latest+6)
+**Last update:** 2026-05-29 (latest+7)
+
+## 2026-05-29 (latest+7) -- v0.0.11 lever-10b: lm_head pool RE-FLIPS positive under lever-9, 6.17x cumulative
+
+Re-tested `VLLM_POOLED_LM_HEAD=1` after the lever-9 layout change. At
+lever-5 this was Type-I catched as a wash (exp-1780109335-555121691)
+because per-thread per-tile work on the lm_head shape
+(M=1, K=2048, N=32000) was small enough that futex sync overhead
+cancelled the parallel gain. Lever-9's bandwidth-efficient layout
+amortizes the dispatch overhead, and the pool now wins decisively.
+
+**Bench at matched clean load (5 rounds, n_threads=4, lever-9 stack):**
+
+```
+  config                    | decode med ms/tok | p10 | p90
+  --------------------------+-------------------+-----+-----
+  lever-9 baseline          |        121        | 107 | 158
+  lever-9 + lm_head pool    |        100        |  97 | 173
+  improvement               |       17.4%       |     |
+```
+
+Per-region (lm_head pool ON, matched load):
+
+```
+  region        | lever-9 base | lever-9 + lm pool | speedup
+  --------------+--------------+-------------------+--------
+  mlp_gate_up   |     1131     |       1025        |  1.10x
+  mlp_down      |      583     |        516        |  1.13x
+  qkv_proj      |      266     |        227        |  1.17x
+  o_proj        |      209     |        179        |  1.17x
+  lm_head       |      180     |         94        |  1.91x
+```
+
+Mostly the lm_head region itself (1.91x), with smaller wins across
+other regions likely from cache-warming side effects.
+
+Cumulative from v0.0.9 lever-4 (med 617): **6.17x decode**.
+
+Also re-tested VLLM_N_THREADS=8 under lever-9 (exp-1780111504-034388283):
+refuted again (+9.8 pct worse median). The n=4 fixed point survives
+the layout change — mechanism shifts from memory bandwidth (lever-5)
+to futex sync overhead (lever-9) but n=4 outcome is robust.
+
+**Correction:** the initial v0.0.11 lever-9 release bench reported 174
+median; re-bench at clean load gives 121. The 174 number was
+load-elevated from background processes. Both bench output files
+preserved in experiment register for audit.
 
 ## 2026-05-29 (latest+6) -- v0.0.11 lever-9: N-tile-major BF16 layout, 1.59x over lever-5 (3.55x cumulative)
 

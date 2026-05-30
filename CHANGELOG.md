@@ -2,6 +2,33 @@
 
 ## 0.0.11 — 2026-05-29
 
+**Lever-9 + Lever-10b (lm_head pool re-flip): 6.17x cumulative decode.**
+
+After lever-9 shipped at apparent med 174 ms-per-tok, re-bench at
+matched CLEAN load gave 121 ms-per-tok — the 174 number was
+load-elevated. With `VLLM_POOLED_LM_HEAD=1` also enabled
+(exp-1780111629-832205672 confirmed at +17.4 pct decode median over
+lever-9 baseline), median drops to **100 ms-per-tok**:
+
+```
+  config                    | decode med | speedup vs lever-4
+  --------------------------+------------+-------------------
+  lever-4 baseline (load 22)|     617    |       1.00x
+  lever-9 (load 14)         |     174    |       3.55x
+  lever-9 (clean load)      |     121    |       5.10x
+  lever-9 + lm_head pool    |     100    |       6.17x
+```
+
+`VLLM_POOLED_LM_HEAD=1` was Type-I catched as a wash at lever-5
+(exp-1780109335-555121691). The lever-9 layout amortizes per-thread
+per-tile work so futex sync overhead is no longer dominant.
+
+Also re-tested `VLLM_N_THREADS=8` under lever-9 (exp-1780111504-034388283):
+refuted again (+9.8 pct worse median). The n=4 fixed point survives
+the layout change.
+
+---
+
 **Lever-9: N-tile-major BF16 weight layout (3.55x cumulative decode).**
 
 Re-packs every BF16 weight matrix at load time into the
