@@ -549,7 +549,11 @@ fn matmulBF16ColRangeKernel(
     const Vec_u32 = @Vector(16, u32);
     const Vec_f32 = @Vector(16, f32);
     const LANE = 16;
-    const TILE = 4 * LANE; // 64 columns per register-blocked N-tile
+    // TILE=64 is the lever-5 fixed point.
+    // (Lever-8 doubled to TILE=128 in exp-1780109796-369194807; refuted —
+    // L1 read-port saturation cancels the larger register block. Decode med
+    // 272 vs 277 was within noise, p90 +25pct worse, mlp_gate_up +10pct.)
+    const TILE = 4 * LANE;
 
     const M = a.rows;
     const N = b_cols;
