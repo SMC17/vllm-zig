@@ -144,6 +144,24 @@ pub fn build(b: *std.Build) void {
     bench_blocked_step.dependOn(&run_bench_blocked.step);
 
     // ------------------------------------------------------------------
+    // bench-bf16-ktile-sweep — K_TILE parameter sweep on lever-12 kernel
+    // ------------------------------------------------------------------
+    const bench_ktile_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_bf16_ktile_sweep.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_ktile_mod.addImport("vllm", mod_fast);
+    const bench_ktile_exe = b.addExecutable(.{
+        .name = "bench-bf16-ktile-sweep",
+        .root_module = bench_ktile_mod,
+    });
+    const run_bench_ktile = b.addRunArtifact(bench_ktile_exe);
+    run_bench_ktile.has_side_effects = true;
+    const bench_ktile_step = b.step("bench-bf16-ktile-sweep", "K_TILE parameter sweep on lever-12 blocked GEMM at M=64");
+    bench_ktile_step.dependOn(&run_bench_ktile.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{
