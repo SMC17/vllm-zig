@@ -199,6 +199,14 @@ pub const LayerWeights = struct {
     w_gate_bf16: ?weights_mod.RawBF16 = null,
     w_up_bf16: ?weights_mod.RawBF16 = null,
     w_down_bf16: ?weights_mod.RawBF16 = null,
+    /// Optional FUSED raw BF16 storage holding [w_gate | w_up] concatenated
+    /// horizontally as a single [hidden, 2 * intermediate] matrix. When this
+    /// field is populated (loadFromSafeTensorsOpts with fuse_mlp_gate_up = true),
+    /// the forward path dispatches ONE pool.matmulBF16Auto call producing a
+    /// fused [seq, 2N] result, then splits it into gate and up halves for
+    /// silu_mul. Eliminates one pool wake/wait round-trip per layer and lets
+    /// the cache prefetcher work across the contiguous concatenated B-matrix.
+    w_gateup_bf16: ?weights_mod.RawBF16 = null,
     /// Optional raw BF16 copies of the attention projections, parallel
     /// to the MLP fields. Populated when LoadOpts.load_attn_bf16 = true.
     /// Used by the v0.0.8 lever-2 attention-pool dispatch path.
@@ -220,6 +228,7 @@ pub const LayerWeights = struct {
         if (self.w_gate_bf16) |*b| b.deinit(alloc);
         if (self.w_up_bf16) |*b| b.deinit(alloc);
         if (self.w_down_bf16) |*b| b.deinit(alloc);
+        if (self.w_gateup_bf16) |*b| b.deinit(alloc);
         if (self.w_q_bf16) |*b| b.deinit(alloc);
         if (self.w_k_bf16) |*b| b.deinit(alloc);
         if (self.w_v_bf16) |*b| b.deinit(alloc);
@@ -235,6 +244,13 @@ pub const LoadOpts = struct {
     /// pool.matmulBF16Auto dispatch reads these on the v0.0.8 MLP path.
     /// Adds roughly 380 MB to the TinyLlama load on top of F32 weights.
     load_mlp_bf16: bool = false,
+    /// When true (and load_mlp_bf16 is also true), pack gate and up
+    /// projections into a single fused w_gateup_bf16 [hidden, 2 * intermediate]
+    /// matrix and SKIP allocating the separate w_gate_bf16 / w_up_bf16
+    /// fields. forward() dispatches one matmul instead of two for the
+    /// gate+up path. Same total memory as load_mlp_bf16 alone (the fused
+    /// matrix replaces the two separates).
+    fuse_mlp_gate_up: bool = false,
     /// When true, also load raw BF16 copies of the attention projections
     /// (w_q / w_k / w_v / w_o) into the parallel _bf16 LayerWeights
     /// fields. The pool.matmulBF16Auto dispatch reads these on the
@@ -401,8 +417,19 @@ pub const Model = struct {
                 .norm_post_attn = try weights_mod.loadVectorBF16(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{i})),
             };
             if (opts.load_mlp_bf16) {
-                layers[i].w_gate_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i}));
-                layers[i].w_up_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i}));
+                if (opts.fuse_mlp_gate_up) {
+                    // Fused gate+up. Both gate and up share input dim hidden,
+                    // output dim intermediate. Concatenate them horizontally
+                    // into a single [hidden, 2 * intermediate] BF16 matrix
+                    // so forward() can dispatch ONE pool.matmulBF16Auto call.
+                    const gate_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i});
+                    var up_name_buf: [256]u8 = undefined;
+                    const up_name = try std.fmt.bufPrint(&up_name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i});
+                    layers[i].w_gateup_bf16 = try weights_mod.loadMatrixBF16RawConcatTransposed(alloc, st, gate_name, up_name);
+                } else {
+                    layers[i].w_gate_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i}));
+                    layers[i].w_up_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i}));
+                }
                 layers[i].w_down_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.down_proj.weight", .{i}));
             }
             if (opts.load_attn_bf16) {
@@ -591,34 +618,73 @@ pub const Model = struct {
             // BF16 weight copies are loaded, dispatch through
             // pool.matmulBF16Auto using the raw BF16 weights. Otherwise
             // fall back to the F32 matmulDispatch path.
-            const mlp_bf16 = self.use_pooled_bf16_mlp and self.pool != null and layer.w_gate_bf16 != null and layer.w_up_bf16 != null and layer.w_down_bf16 != null;
+            //
+            // Gate+up fusion (LoadOpts.fuse_mlp_gate_up): when w_gateup_bf16
+            // is populated, dispatch ONE matmul against the concatenated
+            // [W_gate | W_up] producing a [seq, 2N] output, then slice
+            // into gate / up halves for silu_mul. Eliminates one pool
+            // wake/wait round-trip per layer.
+            const mlp_bf16 = self.use_pooled_bf16_mlp and self.pool != null and ((layer.w_gateup_bf16 != null) or (layer.w_gate_bf16 != null and layer.w_up_bf16 != null)) and layer.w_down_bf16 != null;
+            const mlp_fused = self.use_pooled_bf16_mlp and self.pool != null and layer.w_gateup_bf16 != null and layer.w_down_bf16 != null;
             const t_gu_start = if (inst != null) nowNs() else 0;
-            var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
-            defer gate.deinit(alloc);
-            var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
-            defer up.deinit(alloc);
-            if (mlp_bf16) {
+
+            // Fused path uses one [seq, 2N] matrix. Split paths each
+            // allocate gate and up [seq, N] separately.
+            const N: usize = cfg.intermediate_size;
+            var gateup_buf: ?Matrix = if (mlp_fused) try Matrix.init(alloc, seq, 2 * N) else null;
+            defer if (gateup_buf) |*gb| gb.deinit(alloc);
+            var gate_buf: ?Matrix = if (!mlp_fused) try Matrix.init(alloc, seq, N) else null;
+            defer if (gate_buf) |*gb| gb.deinit(alloc);
+            var up_buf: ?Matrix = if (!mlp_fused) try Matrix.init(alloc, seq, N) else null;
+            defer if (up_buf) |*ub| ub.deinit(alloc);
+
+            if (mlp_fused) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&x, layer.w_gate_bf16.?.data, layer.w_gate_bf16.?.rows, layer.w_gate_bf16.?.cols, &gate, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_up_bf16.?.data, layer.w_up_bf16.?.rows, layer.w_up_bf16.?.cols, &up, self.n_threads);
+                const gu = layer.w_gateup_bf16.?;
+                try p.matmulBF16Auto(&x, gu.data, gu.rows, gu.cols, &gateup_buf.?, self.n_threads);
+            } else if (mlp_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&x, layer.w_gate_bf16.?.data, layer.w_gate_bf16.?.rows, layer.w_gate_bf16.?.cols, &gate_buf.?, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_up_bf16.?.data, layer.w_up_bf16.?.rows, layer.w_up_bf16.?.cols, &up_buf.?, self.n_threads);
             } else {
-                try self.matmulDispatch(&x, &layer.w_gate, &gate);
-                try self.matmulDispatch(&x, &layer.w_up, &up);
+                try self.matmulDispatch(&x, &layer.w_gate, &gate_buf.?);
+                try self.matmulDispatch(&x, &layer.w_up, &up_buf.?);
             }
             if (inst) |ip| ip.add(.mlp_gate_up, nowNs() - t_gu_start);
 
             const t_silu_start = if (inst != null) nowNs() else 0;
-            try silu.siluMul(gate.data, up.data);
+            // In the fused path silu_mul reads gateup[0..N] (gate) and
+            // gateup[N..2N] (up) and writes the result into the gate half
+            // so the down matmul can consume gateup[0..N] directly.
+            if (mlp_fused) {
+                const gb = &gateup_buf.?;
+                const total_n = seq * N;
+                try silu.siluMul(gb.data[0..total_n], gb.data[total_n .. total_n * 2]);
+            } else {
+                try silu.siluMul(gate_buf.?.data, up_buf.?.data);
+            }
             if (inst) |ip| ip.add(.silu_mul, nowNs() - t_silu_start);
 
             const t_down_start = if (inst != null) nowNs() else 0;
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
+
+            // Build a Matrix view of the silu_mul result for the down input.
+            // In the fused path this is a non-owning view onto the first
+            // half of gateup_buf (data slice ends inside gateup_buf.data;
+            // we never deinit this synthetic Matrix). In the split path
+            // gate_buf is already the right shape.
+            var down_input: Matrix = if (mlp_fused) .{
+                .rows = seq,
+                .cols = N,
+                .data = gateup_buf.?.data[0 .. seq * N],
+            } else gate_buf.?;
+
             if (mlp_bf16) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&gate, layer.w_down_bf16.?.data, layer.w_down_bf16.?.rows, layer.w_down_bf16.?.cols, &down_out, self.n_threads);
+                try p.matmulBF16Auto(&down_input, layer.w_down_bf16.?.data, layer.w_down_bf16.?.rows, layer.w_down_bf16.?.cols, &down_out, self.n_threads);
             } else {
-                try self.matmulDispatch(&gate, &layer.w_down, &down_out);
+                try self.matmulDispatch(&down_input, &layer.w_down, &down_out);
             }
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;

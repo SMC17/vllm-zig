@@ -19,6 +19,7 @@ pub const Error = error{
     UnexpectedDtype,
     ExpectedMatrix,
     ExpectedVector,
+    DimensionMismatch,
     OutOfMemory,
 };
 
@@ -206,6 +207,41 @@ pub fn loadMatrixBF16RawTransposed(
         }
     }
     return .{ .data = out, .rows = raw.cols, .cols = raw.rows };
+}
+
+/// Load two BF16 matrices (gate_proj and up_proj in Llama MLP) and
+/// produce a single fused [in_features, 2 * out_features] raw BF16
+/// matrix where each input-feature row holds [gate_row | up_row]
+/// concatenated horizontally. Used by the v0.0.8 gate+up fusion path
+/// so forward() can dispatch one matmul instead of two against the
+/// same input x. Both source matrices must share their input-feature
+/// dim. The output layout matches matmul_bf16.matmulBF16SIMD's
+/// expectations: rows = K (input dim), cols = 2N (concatenated outputs).
+pub fn loadMatrixBF16RawConcatTransposed(
+    alloc: std.mem.Allocator,
+    st: *safetensors.SafeTensors,
+    gate_name: []const u8,
+    up_name: []const u8,
+) !RawBF16 {
+    var gate = try loadMatrixBF16RawTransposed(alloc, st, gate_name);
+    defer alloc.free(gate.data);
+    var up = try loadMatrixBF16RawTransposed(alloc, st, up_name);
+    defer alloc.free(up.data);
+
+    if (gate.rows != up.rows or gate.cols != up.cols) return Error.DimensionMismatch;
+
+    const K = gate.rows;
+    const N = gate.cols;
+    const out = try alloc.alloc(u16, K * 2 * N);
+    errdefer alloc.free(out);
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        const gate_src = gate.data[k * N ..][0..N];
+        const up_src = up.data[k * N ..][0..N];
+        @memcpy(out[k * 2 * N ..][0..N], gate_src);
+        @memcpy(out[k * 2 * N + N ..][0..N], up_src);
+    }
+    return .{ .data = out, .rows = K, .cols = 2 * N };
 }
 
 /// Convenience: load a matrix and transpose it. HF stores attention

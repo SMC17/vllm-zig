@@ -52,11 +52,13 @@ pub fn main(init: std.process.Init) !void {
     const env_pool_lm = init.environ_map.get("VLLM_POOLED_LM_HEAD");
     const env_pool_mlp = init.environ_map.get("VLLM_POOLED_MLP");
     const env_pool_attn = init.environ_map.get("VLLM_POOLED_ATTN");
+    const env_pool_mlp_fused = init.environ_map.get("VLLM_POOLED_MLP_FUSED");
     const env_ab = init.environ_map.get("VLLM_AB_TOGGLE");
     const instrument_on = env_instrument != null and !std.mem.eql(u8, env_instrument.?, "0");
     const pool_lm_on = env_pool_lm != null and !std.mem.eql(u8, env_pool_lm.?, "0");
     const pool_mlp_on = env_pool_mlp != null and !std.mem.eql(u8, env_pool_mlp.?, "0");
     const pool_attn_on = env_pool_attn != null and !std.mem.eql(u8, env_pool_attn.?, "0");
+    const pool_mlp_fused = env_pool_mlp_fused != null and !std.mem.eql(u8, env_pool_mlp_fused.?, "0");
     const ab_toggle = env_ab != null and !std.mem.eql(u8, env_ab.?, "0");
 
     if (!instrument_on) {
@@ -79,7 +81,8 @@ pub fn main(init: std.process.Init) !void {
     } else {
         std.debug.print("pooled MLP:     {s}\n", .{if (pool_mlp_on) "ON (VLLM_POOLED_MLP=1, lever-1 retarget)" else "off (baseline F32 pool.matmulAuto)"});
     }
-    std.debug.print("pooled attn:    {s}\n\n", .{if (pool_attn_on) "ON (VLLM_POOLED_ATTN=1, lever-2)" else "off (baseline F32 pool.matmulAuto)"});
+    std.debug.print("pooled attn:    {s}\n", .{if (pool_attn_on) "ON (VLLM_POOLED_ATTN=1, lever-2)" else "off (baseline F32 pool.matmulAuto)"});
+    std.debug.print("mlp gate+up fused: {s}\n\n", .{if (pool_mlp_fused) "ON (VLLM_POOLED_MLP_FUSED=1, lever-3)" else "off (2 separate matmul calls)"});
 
     var cfg_path_buf: [256]u8 = undefined;
     const cfg_path = try std.fmt.bufPrint(&cfg_path_buf, "{s}/config.json", .{MODEL_DIR});
@@ -102,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
     const t_load_start = std.Io.Clock.awake.now(io);
     var model = try vllm.model.Model.loadFromSafeTensorsOpts(alloc, &st, cfg, .{
         .load_mlp_bf16 = pool_mlp_on or ab_toggle,
+        .fuse_mlp_gate_up = pool_mlp_fused,
         .load_attn_bf16 = pool_attn_on,
     });
     defer model.deinit();
