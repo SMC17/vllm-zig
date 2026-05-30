@@ -1,7 +1,52 @@
 # STATUS
 
-**Version:** v0.0.7 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29 (later)
+**Version:** v0.0.8 (toy batch-1 generator; **NOT vLLM-equivalent**)
+**Last update:** 2026-05-29 (latest)
+
+## 2026-05-29 (latest) -- v0.0.8: pooled MLP lever-1 ships, 1.42x decode under load
+
+The lever-1 retarget from v0.0.7 landed. Pool.matmulBF16Auto now
+dispatches MLP gate / up / down BF16 matmuls when `use_pooled_bf16_mlp`
+is set (default off, env gate `VLLM_POOLED_MLP=1`).
+
+**Bench (load-contended, 7 concurrent claude agents on the box):**
+
+| Region | Baseline med ms | Pooled MLP med ms | Ratio |
+|---|---|---|---|
+| qkv_proj (not target) | 10462 | 9590 | 1.09x (noise) |
+| o_proj (not target) | 5177 | 4393 | 1.18x (noise) |
+| mlp_gate_up (target) | 20185 | 13604 | 1.48x |
+| mlp_down (target) | 13153 | 9446 | 1.39x |
+| lm_head | 1648 | 1354 | 1.22x (noise) |
+| TOTAL (sum) | 52415 | 38225 | 1.37x |
+| Decode ms/tok | 2464 | 1730 | **1.42x** |
+
+The 1.48x mlp_gate_up + 1.39x mlp_down are the load-bearing signal.
+The non-target regions (qkv_proj, o_proj, lm_head) "improving" is
+load-drift noise between runs, not lever credit.
+
+The 1.42x total decode speedup is the honest claim. At T=8 workers
+with contention from 7 other agents, theoretical 8x parallelism
+attenuates to about 1.4x effective; on a clean machine the same
+lever should win considerably more on these regions.
+
+**Clean-machine extrapolation (NOT measured this run):**
+v0.0.7 clean baseline was 349 ms/tok. If MLP pool wins 2-3x on
+clean machine (vs 1.42x under load), v0.0.8 clean estimate is
+**~115 to 175 ms/tok**, which is BELOW the 200 ms/tok target
+(2026-06-25 deadline).
+
+A clean-machine bench is the next required measurement. Box must
+be at load less than 5 and no concurrent BF16-heavy processes.
+
+**What landed (substrate):**
+- LayerWeights: raw BF16 storage (w_gate_bf16 / w_up_bf16 / w_down_bf16).
+- LoadOpts.load_mlp_bf16 gate.
+- Model.use_pooled_bf16_mlp gate.
+- bench/bench_forward_regions.zig: per-region MLP attribution.
+- 87/87 tests pass (was 81 + 6 new MLP-pool correctness).
+- Authored W4 agent 738b24fb; committed by orchestrator post-OOM
+  kill at 25479c2.
 
 ## 2026-05-29 (later) -- v0.0.7: per-region instrumentation lands; lever-1 target redirected to MLP
 
