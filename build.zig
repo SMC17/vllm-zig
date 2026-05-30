@@ -180,6 +180,24 @@ pub fn build(b: *std.Build) void {
     bench_mblock_step.dependOn(&run_bench_mblock.step);
 
     // ------------------------------------------------------------------
+    // bench-int8-ntile — lever-14 int8 quantization microbench
+    // ------------------------------------------------------------------
+    const bench_int8_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench_int8_ntile.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_int8_mod.addImport("vllm", mod_fast);
+    const bench_int8_exe = b.addExecutable(.{
+        .name = "bench-int8-ntile",
+        .root_module = bench_int8_mod,
+    });
+    const run_bench_int8 = b.addRunArtifact(bench_int8_exe);
+    run_bench_int8.has_side_effects = true;
+    const bench_int8_step = b.step("bench-int8-ntile", "Lever-14 int8 quantization accuracy + perf microbench");
+    bench_int8_step.dependOn(&run_bench_int8.step);
+
+    // ------------------------------------------------------------------
     // bench-tiled — tiled vs non-tiled matmul scan
     // ------------------------------------------------------------------
     const bench_tiled_mod = b.createModule(.{

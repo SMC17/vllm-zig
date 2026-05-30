@@ -419,6 +419,127 @@ pub fn matmulBF16SIMDNtileMajor(
     }
 }
 
+/// Lever-14: int8 per-column quantized matmul, N-tile-major layout.
+///
+/// b layout: [n_tile_outer, K, n_tile_inner=TILE=64] i8 (lever-9 layout
+/// with i8 elements instead of u16). scales: [N] f32, per-output-column.
+///
+/// Schedule (M=1 register-blocked, 4 ZMM accumulators per 64-col tile):
+///   for n_tile in 0..N/64:
+///     accs[4] = 0 (f32)
+///     for k in 0..K:
+///       a_scalar = splat(a[k])
+///       b0..b3 = widen i8 to f32 from b[n_tile][k][0..64]
+///       acc[t] = fmadd(a_scalar, b[t], acc[t])
+///     // Apply per-column scale at output time
+///     c[n_tile..n_tile+64] = accs[0..4] * scales[n_tile*64..(n_tile+1)*64]
+///
+/// Memory traffic vs BF16 lever-9 path: b stream is K*N bytes (half of BF16's
+/// K*N*2). Scales add 4*N bytes per matmul (trivial — 8 KB at N=2048).
+///
+/// Widening sequence on Ice Lake AVX-512:
+///   16 i8 (16 bytes)  → VPMOVSXBD → 16 i32 (zmm)
+///   16 i32            → VCVTDQ2PS → 16 f32 (zmm)
+/// Two instructions per ZMM tile; throughput is L1 read port + FMA.
+pub fn matmulINT8SIMDNtileMajor(
+    a: *const Matrix,
+    b: []const i8,
+    scales: []const f32,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+) Error!void {
+    if (a.cols != b_rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+    if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+    if (scales.len != b_cols) return Error.DimensionMismatch;
+
+    const Vec_i8 = @Vector(16, i8);
+    const Vec_i32 = @Vector(16, i32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
+    const TILE = 4 * LANE; // 64
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+    const n_tiles = N / TILE;
+    const n_remainder = N - n_tiles * TILE;
+
+    @memset(c.data, 0.0);
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+
+        var nt: usize = 0;
+        while (nt < n_tiles) : (nt += 1) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+
+            const tile_base = nt * K * TILE;
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a_row[k]);
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+
+                const b0_i8: Vec_i8 = b_row[0..LANE].*;
+                const b1_i8: Vec_i8 = b_row[LANE..][0..LANE].*;
+                const b2_i8: Vec_i8 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_i8: Vec_i8 = b_row[3 * LANE ..][0..LANE].*;
+
+                // i8 → i32 sign-extend → f32 cast (VPMOVSXBD + VCVTDQ2PS).
+                const b0_i32: Vec_i32 = b0_i8;
+                const b1_i32: Vec_i32 = b1_i8;
+                const b2_i32: Vec_i32 = b2_i8;
+                const b3_i32: Vec_i32 = b3_i8;
+
+                const b0_f32: Vec_f32 = @floatFromInt(b0_i32);
+                const b1_f32: Vec_f32 = @floatFromInt(b1_i32);
+                const b2_f32: Vec_f32 = @floatFromInt(b2_i32);
+                const b3_f32: Vec_f32 = @floatFromInt(b3_i32);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
+            }
+
+            // Multiply by per-column scales before store.
+            const c_base = nt * TILE;
+            const s0: Vec_f32 = scales[c_base..][0..LANE].*;
+            const s1: Vec_f32 = scales[c_base + LANE ..][0..LANE].*;
+            const s2: Vec_f32 = scales[c_base + 2 * LANE ..][0..LANE].*;
+            const s3: Vec_f32 = scales[c_base + 3 * LANE ..][0..LANE].*;
+
+            c_row[c_base..][0..LANE].* = acc0 * s0;
+            c_row[c_base + LANE ..][0..LANE].* = acc1 * s1;
+            c_row[c_base + 2 * LANE ..][0..LANE].* = acc2 * s2;
+            c_row[c_base + 3 * LANE ..][0..LANE].* = acc3 * s3;
+        }
+
+        // Scalar tail for N % TILE columns.
+        if (n_remainder > 0) {
+            const tail_base = n_tiles * K * TILE;
+            const tail_c_base = n_tiles * TILE;
+            var j: usize = 0;
+            while (j < n_remainder) : (j += 1) {
+                var acc: f32 = 0.0;
+                var k: usize = 0;
+                while (k < K) : (k += 1) {
+                    const bv: f32 = @floatFromInt(b[tail_base + k * n_remainder + j]);
+                    acc += a_row[k] * bv;
+                }
+                c_row[tail_c_base + j] = acc * scales[tail_c_base + j];
+            }
+        }
+    }
+}
+
 /// Comptime-blocked BF16 GEMM kernel (substrate primitive).
 ///
 /// Parameterised on M_BLOCK (rows accumulated together), N_TILE (cols per

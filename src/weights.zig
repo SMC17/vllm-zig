@@ -158,6 +158,105 @@ pub const RawBF16 = struct {
     }
 };
 
+/// Lever-14: per-column symmetric int8 quantization of a BF16 weight matrix
+/// packed into N-tile-major layout. Scale per output column is
+/// `max(|w[:, j]|) / 127`; quantized value is `round(w[i,j] / scale_j)`
+/// clamped to [-128, 127].
+///
+/// Output layout matches lever-9 N-tile-major for direct kernel consumption:
+///   data: [n_tile_outer, K, n_tile_inner=TILE=64] i8, K * N bytes total
+///   scales: [N] f32, one per output column
+///
+/// Memory savings: int8 is 0.5x BF16 (i8 1 byte vs BF16 2 bytes). Per
+/// TinyLlama mlp_gate_up: 46 MB BF16 → 23 MB i8 + 45 KB scales = ~50% cut.
+///
+/// Accuracy floor (caller-validated): per-column scale keeps max-magnitude
+/// elements within 1/127 ~ 0.78pct of f32 reference. K=2048 accumulated
+/// error grows as sqrt(K) * sigma but cancels across positive/negative
+/// weight distributions for typical LLM matmul. Expect approximately 1-5pct
+/// relative error on output magnitudes vs BF16.
+pub const RawINT8 = struct {
+    data: []i8,
+    scales: []f32,
+    rows: usize,
+    cols: usize,
+
+    pub fn deinit(self: *RawINT8, alloc: std.mem.Allocator) void {
+        alloc.free(self.data);
+        alloc.free(self.scales);
+    }
+};
+
+pub fn quantizeBF16ToINT8NtileMajor(
+    alloc: std.mem.Allocator,
+    raw: RawBF16,
+) !RawINT8 {
+    const TILE: usize = 64;
+    const K = raw.rows;
+    const N = raw.cols;
+    const n_tiles = N / TILE;
+    const n_remainder = N - n_tiles * TILE;
+
+    // Compute per-column scales from BF16 source.
+    const scales = try alloc.alloc(f32, N);
+    errdefer alloc.free(scales);
+    {
+        var j: usize = 0;
+        while (j < N) : (j += 1) {
+            var max_abs: f32 = 0;
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const bits: u32 = @as(u32, raw.data[k * N + j]) << 16;
+                const v: f32 = @bitCast(bits);
+                const av: f32 = @abs(v);
+                if (av > max_abs) max_abs = av;
+            }
+            // Tiny-magnitude columns: use scale=1.0 to avoid division by zero
+            // and to keep int8 output exactly zero.
+            scales[j] = if (max_abs > 0) max_abs / 127.0 else 1.0;
+        }
+    }
+
+    // Pack into N-tile-major with int8 values.
+    const out = try alloc.alloc(i8, K * N);
+    errdefer alloc.free(out);
+
+    var nt: usize = 0;
+    while (nt < n_tiles) : (nt += 1) {
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var i: usize = 0;
+            while (i < TILE) : (i += 1) {
+                const j = nt * TILE + i;
+                const bits: u32 = @as(u32, raw.data[k * N + j]) << 16;
+                const v: f32 = @bitCast(bits);
+                const q: f32 = @round(v / scales[j]);
+                const clamped: f32 = @max(-128.0, @min(127.0, q));
+                out[nt * K * TILE + k * TILE + i] = @intFromFloat(clamped);
+            }
+        }
+    }
+
+    // Tail columns row-major (matching repackBF16ToNtileMajor's trailing layout).
+    if (n_remainder > 0) {
+        const tail_base = n_tiles * K * TILE;
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var j: usize = 0;
+            while (j < n_remainder) : (j += 1) {
+                const col = n_tiles * TILE + j;
+                const bits: u32 = @as(u32, raw.data[k * N + col]) << 16;
+                const v: f32 = @bitCast(bits);
+                const q: f32 = @round(v / scales[col]);
+                const clamped: f32 = @max(-128.0, @min(127.0, q));
+                out[tail_base + k * n_remainder + j] = @intFromFloat(clamped);
+            }
+        }
+    }
+
+    return .{ .data = out, .scales = scales, .rows = K, .cols = N };
+}
+
 /// Lever-9: re-pack a row-major RawBF16 ([K, N]) into N-tile-major layout
 /// [N_tile_outer, K, N_tile_inner=TILE] where TILE=64 matches the
 /// register-blocked kernel's N-tile width. Reads with stride-1 within
