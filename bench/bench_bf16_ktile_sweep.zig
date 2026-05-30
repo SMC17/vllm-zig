@@ -21,20 +21,24 @@ const Matrix = vllm.Matrix;
 const matmul_bf16 = vllm.matmul_bf16;
 const weights = vllm.weights;
 
-const M: usize = 64;
 const K: usize = 2048;
-const N: usize = 2048;
 const TILE: usize = 64;
-const ITERS: usize = 30;
+const ITERS: usize = 20;
 
 const K_TILES = [_]usize{ 32, 64, 128, 256, 512, 1024, 2048 };
 
-pub fn main(init: std.process.Init) !void {
-    const alloc = init.gpa;
-    const io = init.io;
+const Shape = struct { M: usize, N: usize, label: []const u8 };
 
-    std.debug.print("=== K_TILE sweep for matmulBF16SIMDBlocked(4, 64, K_TILE) ===\n", .{});
-    std.debug.print("shape: M={d} K={d} N={d}, single-thread, ReleaseFast\n\n", .{ M, K, N });
+const SHAPES = [_]Shape{
+    .{ .M = 64, .N = 2048, .label = "M=64  N= 2048 (prefill)" },
+    .{ .M = 16, .N = 32000, .label = "M=16  N=32000 (lm_head prefill)" },
+};
+
+fn sweepShape(alloc: std.mem.Allocator, io: std.Io, shape: Shape) !void {
+    const M = shape.M;
+    const N = shape.N;
+
+    std.debug.print("\n=== {s} K={d} ===\n", .{ shape.label, K });
 
     var a = try Matrix.init(alloc, M, K);
     defer a.deinit(alloc);
@@ -58,15 +62,14 @@ pub fn main(init: std.process.Init) !void {
     var c = try Matrix.init(alloc, M, N);
     defer c.deinit(alloc);
 
-    std.debug.print("  K_TILE | b-tile size (one n-tile) | med us/call | rel  | rows/sec\n", .{});
-    std.debug.print("  ------ | ------------------------ | ----------- | ---- | --------\n", .{});
+    std.debug.print("  K_TILE | b-tile KB | med us/call | rows/sec\n", .{});
+    std.debug.print("  ------ | --------- | ----------- | --------\n", .{});
 
     var best_ns: u64 = std.math.maxInt(u64);
     var best_ktile: usize = 0;
 
     inline for (K_TILES) |kt| {
-        // Warmup
-        for (0..5) |_| {
+        for (0..3) |_| {
             try matmul_bf16.matmulBF16SIMDBlocked(4, 64, kt, &a, b_nt.data, K, N, &c);
         }
         const t0 = std.Io.Clock.awake.now(io);
@@ -75,8 +78,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const ns: u64 = @intCast(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
         const us_per_call = ns / ITERS / 1_000;
-        const b_tile_bytes: usize = kt * TILE * 2;
-        const b_tile_kb = b_tile_bytes / 1024;
+        const b_tile_kb: usize = (kt * TILE * 2) / 1024;
         const rows_per_sec: u64 = @intFromFloat(@as(f64, @floatFromInt(M * ITERS)) * 1.0e9 / @as(f64, @floatFromInt(ns)));
 
         if (ns < best_ns) {
@@ -84,9 +86,20 @@ pub fn main(init: std.process.Init) !void {
             best_ktile = kt;
         }
 
-        std.debug.print("  K={d:>5} | {d:>5} KB                  | {d:>9}   |      | {d:>7}\n", .{ kt, b_tile_kb, us_per_call, rows_per_sec });
+        std.debug.print("  K={d:>5} | {d:>5}     | {d:>9}   | {d:>7}\n", .{ kt, b_tile_kb, us_per_call, rows_per_sec });
     }
 
-    std.debug.print("\nbest K_TILE: {d} ({d} us/call)\n", .{ best_ktile, best_ns / ITERS / 1_000 });
-    std.debug.print("Anti-DCE checksum: c[0]={d:.4}\n", .{c.data[0]});
+    std.debug.print("  best: K_TILE={d} at {d} us/call\n", .{ best_ktile, best_ns / ITERS / 1_000 });
+}
+
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    std.debug.print("=== K_TILE sweep for matmulBF16SIMDBlocked(4, 64, K_TILE) ===\n", .{});
+    std.debug.print("single-thread, ReleaseFast\n", .{});
+
+    for (SHAPES) |shape| {
+        try sweepShape(alloc, io, shape);
+    }
 }
