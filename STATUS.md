@@ -39,6 +39,47 @@ clean machine (vs 1.42x under load), v0.0.8 clean estimate is
 A clean-machine bench is the next required measurement. Box must
 be at load less than 5 and no concurrent BF16-heavy processes.
 
+## 2026-05-29 (latest+1) -- CORRECTION: clean-machine pool win is 1.17x, not 1.42x
+
+Type-1 catch on the earlier extrapolation. SIGSTOPped the 6 active
+claude agents and ran both baseline and pooled benches under
+proper clean conditions:
+
+| Metric | Baseline | Pooled MLP | Win |
+|---|---|---|---|
+| qkv_proj med | 838 ms | 821 ms | 1.02x (no change region) |
+| o_proj med | 603 ms | 605 ms | 1.00x (no change region) |
+| mlp_gate_up med | 2701 ms | 1968 ms | 1.37x |
+| mlp_down med | 1634 ms | 1272 ms | 1.28x |
+| lm_head med | 271 ms | 262 ms | 1.03x (no change region) |
+| TOTAL (sum) med | 6149 ms | 5000 ms | 1.23x |
+| **Decode ms/tok** | **297** | **253** | **1.17x** |
+
+**The under-contention 1.42x was inflated.** Single-thread baseline
+got hurt by contention more than the pool did, so the ratio
+artificially favored the pool. Pure substrate win at the target
+regions is 1.37x mlp_gate_up + 1.28x mlp_down, which propagates
+to a 1.17x decode win because non-MLP regions remained unchanged.
+
+**v0.0.8 lands at 253 ms/tok clean, NOT BELOW the 200 target.**
+Gap to target: 53 ms/tok = ~21% more speedup needed.
+
+**Remaining levers ranked by leverage:**
+1. Cache-tiled BF16 matmul (mlp_gate_up + mlp_down). The F32 tiled
+   path hit 2.5x at large N; a BF16 tiled implementation should
+   close some of the residual gap. New task #152.
+2. AVX-512 zmm widen on the BF16 SIMD kernel (currently ymm 8-wide;
+   zmm would be 16-wide on Ice Lake-U which supports AVX-512F).
+3. KV cache contiguous reads on the attention path (currently 0.7%
+   so little leverage at decode, but compound win across operations).
+4. F32 weight elimination - currently F32 copies of MLP weights
+   are held alongside BF16 for the lm_head single-thread path;
+   dropping them on use_pooled_bf16_mlp=true would reduce DRAM
+   pressure.
+
+The 200 target by 2026-06-25 remains achievable - 21% from one
+more substrate lever is reasonable. Not a single-lever close.
+
 **What landed (substrate):**
 - LayerWeights: raw BF16 storage (w_gate_bf16 / w_up_bf16 / w_down_bf16).
 - LoadOpts.load_mlp_bf16 gate.
