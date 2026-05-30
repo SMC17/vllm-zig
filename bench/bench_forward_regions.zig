@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
     const env_pool_attn = init.environ_map.get("VLLM_POOLED_ATTN");
     const env_pool_mlp_fused = init.environ_map.get("VLLM_POOLED_MLP_FUSED");
     const env_qkv_fused = init.environ_map.get("VLLM_QKV_FUSED");
+    const env_ntile = init.environ_map.get("VLLM_BF16_NTILE_MAJOR");
     const env_ab = init.environ_map.get("VLLM_AB_TOGGLE");
     const instrument_on = env_instrument != null and !std.mem.eql(u8, env_instrument.?, "0");
     const pool_lm_on = env_pool_lm != null and !std.mem.eql(u8, env_pool_lm.?, "0");
@@ -61,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     const pool_attn_on = env_pool_attn != null and !std.mem.eql(u8, env_pool_attn.?, "0");
     const pool_mlp_fused = env_pool_mlp_fused != null and !std.mem.eql(u8, env_pool_mlp_fused.?, "0");
     const qkv_fused = env_qkv_fused != null and !std.mem.eql(u8, env_qkv_fused.?, "0");
+    const bf16_ntile_major = env_ntile != null and !std.mem.eql(u8, env_ntile.?, "0");
     const ab_toggle = env_ab != null and !std.mem.eql(u8, env_ab.?, "0");
 
     if (!instrument_on) {
@@ -85,7 +87,8 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("pooled attn:    {s}\n", .{if (pool_attn_on) "ON (VLLM_POOLED_ATTN=1, lever-2)" else "off (baseline F32 pool.matmulAuto)"});
     std.debug.print("mlp gate+up fused: {s}\n", .{if (pool_mlp_fused) "ON (VLLM_POOLED_MLP_FUSED=1, lever-3)" else "off (2 separate matmul calls)"});
-    std.debug.print("qkv fused:      {s}\n\n", .{if (qkv_fused) "ON (VLLM_QKV_FUSED=1, lever-4)" else "off (3 separate matmul calls)"});
+    std.debug.print("qkv fused:      {s}\n", .{if (qkv_fused) "ON (VLLM_QKV_FUSED=1, lever-4)" else "off (3 separate matmul calls)"});
+    std.debug.print("bf16 ntile-maj: {s}\n\n", .{if (bf16_ntile_major) "ON (VLLM_BF16_NTILE_MAJOR=1, lever-9)" else "off (row-major layout)"});
 
     var cfg_path_buf: [256]u8 = undefined;
     const cfg_path = try std.fmt.bufPrint(&cfg_path_buf, "{s}/config.json", .{MODEL_DIR});
@@ -111,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
         .fuse_mlp_gate_up = pool_mlp_fused,
         .load_attn_bf16 = pool_attn_on,
         .fuse_qkv = qkv_fused,
+        .bf16_ntile_major = bf16_ntile_major,
     });
     defer model.deinit();
     // VLLM_N_THREADS env override (default = logical CPU count).
@@ -131,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
     defer pool.deinit();
     model.setThreadPool(pool);
     model.setPooledBF16LMHead(pool_lm_on);
+    model.setBF16NtileMajor(bf16_ntile_major);
     // Initial MLP state. In A/B mode this gets flipped per round below.
     model.setPooledBF16MLP(pool_mlp_on);
     model.setPooledBF16Attn(pool_attn_on);

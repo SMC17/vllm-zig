@@ -158,6 +158,58 @@ pub const RawBF16 = struct {
     }
 };
 
+/// Lever-9: re-pack a row-major RawBF16 ([K, N]) into N-tile-major layout
+/// [N_tile_outer, K, N_tile_inner=TILE] where TILE=64 matches the
+/// register-blocked kernel's N-tile width. Reads with stride-1 within
+/// tiles (vs stride-N for row-major) so Ice Lake L2 streamer engages
+/// on the inner K loop.
+///
+/// Trailing N % TILE columns are appended in row-major layout
+/// (K * remainder bytes contiguous after the tiled region); the
+/// matmulBF16SIMDNtileMajor kernel reads them via the scalar tail path.
+///
+/// Caller must free the input RawBF16 separately; output is a new
+/// allocation with identical (rows, cols) but transformed data layout.
+pub fn repackBF16ToNtileMajor(
+    alloc: std.mem.Allocator,
+    raw: RawBF16,
+) !RawBF16 {
+    const TILE: usize = 64;
+    const K = raw.rows;
+    const N = raw.cols;
+    const n_tiles = N / TILE;
+    const n_remainder = N - n_tiles * TILE;
+
+    const out = try alloc.alloc(u16, K * N);
+    errdefer alloc.free(out);
+
+    var nt: usize = 0;
+    while (nt < n_tiles) : (nt += 1) {
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var i: usize = 0;
+            while (i < TILE) : (i += 1) {
+                out[nt * K * TILE + k * TILE + i] = raw.data[k * N + nt * TILE + i];
+            }
+        }
+    }
+
+    // Remainder columns (N % TILE) packed as K rows of n_remainder
+    // BF16 each, contiguous after the tiled region.
+    if (n_remainder > 0) {
+        const tail_base = n_tiles * K * TILE;
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            var j: usize = 0;
+            while (j < n_remainder) : (j += 1) {
+                out[tail_base + k * n_remainder + j] = raw.data[k * N + n_tiles * TILE + j];
+            }
+        }
+    }
+
+    return .{ .data = out, .rows = K, .cols = N };
+}
+
 pub fn loadMatrixBF16Raw(
     alloc: std.mem.Allocator,
     st: *safetensors.SafeTensors,

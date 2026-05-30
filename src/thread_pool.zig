@@ -51,6 +51,7 @@ const WorkKind = enum(u32) {
     shutdown = 3,
     bf16_row_split = 4,
     bf16_col_split = 5,
+    bf16_ntile_col_split = 6, // lever-9: N-tile-major layout, per-thread tile range
 };
 
 const Job = struct {
@@ -251,6 +252,46 @@ pub const Pool = struct {
         return self.matmulBF16ColSplit(a, b, b_rows, b_cols, c, n_workers);
     }
 
+    /// Lever-9: N-tile-major BF16 matmul via col-split. Each thread owns
+    /// a contiguous range of 64-column tile indices and walks them with
+    /// stride-1 K access. b must be pre-repacked via
+    /// weights.repackBF16ToNtileMajor at load time.
+    ///
+    /// Precondition: N (b_cols) and the per-thread N share must be
+    /// divisible by TILE=64 — true for all TinyLlama BF16 matmuls at
+    /// n_workers=4. Falls back to single-thread matmulBF16SIMDNtileMajor
+    /// when n_workers <= 1.
+    pub fn matmulBF16NtileMajorAuto(
+        self: *Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+        n_workers: usize,
+    ) Error!void {
+        const TILE: usize = 64;
+        if (a.cols != b_rows) return Error.DimensionMismatch;
+        if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+        if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+        if (n_workers <= 1 or b_cols < TILE * 2) {
+            matmul_bf16_kernels.matmulBF16SIMDNtileMajor(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+
+        const N = b_cols;
+        const n_tiles = N / TILE;
+        const T = @min(@min(n_workers, n_tiles), self.threads.len);
+        if (T <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMDNtileMajor(a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+
+        @memset(c.data, 0.0);
+        const tile_chunk = (n_tiles + T - 1) / T;
+        try self.submitBF16(.bf16_ntile_col_split, a, b, b_rows, b_cols, c, T, fillTileRanges, .{ tile_chunk, n_tiles });
+    }
+
     fn submit(
         self: *Pool,
         kind: WorkKind,
@@ -345,6 +386,15 @@ fn fillColRanges(ranges: *[max_workers][2]usize, chunk: usize, N: usize) void {
     }
 }
 
+fn fillTileRanges(ranges: *[max_workers][2]usize, tile_chunk: usize, n_tiles: usize) void {
+    var t: usize = 0;
+    while (t < max_workers) : (t += 1) {
+        const start = t * tile_chunk;
+        const end = @min(start + tile_chunk, n_tiles);
+        ranges[t] = .{ start, end };
+    }
+}
+
 fn workerLoop(pool: *Pool, id: usize) void {
     var my_round: u32 = 0;
     while (true) {
@@ -377,6 +427,15 @@ fn workerLoop(pool: *Pool, id: usize) void {
                             range[1],
                         ),
                         .bf16_col_split => if (pool.job.b_bf16) |bb| matmulBF16ColRangeKernel(
+                            a,
+                            bb,
+                            pool.job.b_bf16_rows,
+                            pool.job.b_bf16_cols,
+                            c,
+                            range[0],
+                            range[1],
+                        ),
+                        .bf16_ntile_col_split => if (pool.job.b_bf16) |bb| matmulBF16NtileColRangeKernel(
                             a,
                             bb,
                             pool.job.b_bf16_rows,
@@ -639,6 +698,86 @@ fn matmulBF16ColRangeKernel(
                 acc += a_row[k] * bv;
             }
             c_row[j] = acc;
+        }
+    }
+}
+
+/// Lever-9: per-thread N-tile-major col-range kernel. Each thread owns
+/// tile indices [tile_start, tile_end) over the n_tiles partition of N.
+/// b layout: [n_tile_outer, K, n_tile_inner=64], so within a tile the
+/// inner K loop sees stride-1 (128-byte tile-row) b reads. Same 4-ZMM
+/// register-block structure as lever-5 — only the b indexing changes.
+///
+/// Caller (pool.matmulBF16NtileMajorAuto) zeroes c before dispatch, so
+/// scalar tail (N % TILE) is touched by the single-thread fallback path
+/// only (the multi-thread path requires N divisible by TILE; the auto
+/// dispatcher falls back when this is not satisfied).
+fn matmulBF16NtileColRangeKernel(
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+    tile_start: usize,
+    tile_end: usize,
+) void {
+    _ = b_rows;
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
+    const TILE = 4 * LANE; // 64
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+        const shift: @Vector(16, u5) = @splat(16);
+
+        var nt: usize = tile_start;
+        while (nt < tile_end) : (nt += 1) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+
+            const tile_base = nt * K * TILE;
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a_row[k]);
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
+            }
+
+            const c_base = nt * TILE;
+            c_row[c_base..][0..LANE].* = acc0;
+            c_row[c_base + LANE ..][0..LANE].* = acc1;
+            c_row[c_base + 2 * LANE ..][0..LANE].* = acc2;
+            c_row[c_base + 3 * LANE ..][0..LANE].* = acc3;
         }
     }
 }

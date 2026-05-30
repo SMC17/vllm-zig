@@ -273,6 +273,12 @@ pub const LoadOpts = struct {
     /// v0.0.8 lever-2 attention path. Adds roughly 100 MB to the
     /// TinyLlama load on top of F32 attention weights.
     load_attn_bf16: bool = false,
+    /// Lever-9: re-pack every BF16 weight matrix at load time into the
+    /// N-tile-major layout consumed by matmulBF16SIMDNtileMajor /
+    /// pool.matmulBF16NtileMajorAuto. Same total bytes, only the
+    /// physical memory ordering changes. forward() must also have
+    /// use_bf16_ntile_major=true for the new kernel path to engage.
+    bf16_ntile_major: bool = false,
 };
 
 pub const Model = struct {
@@ -318,6 +324,11 @@ pub const Model = struct {
     /// pool.matmulBF16Auto using the raw BF16 weight copies. Requires
     /// load_attn_bf16 = true at load time. v0.0.8 lever-2.
     use_pooled_bf16_attn: bool = false,
+    /// Lever-9: when true, use pool.matmulBF16NtileMajorAuto (which calls
+    /// the N-tile-major col-range kernel) for every pooled BF16 dispatch
+    /// site. Requires LoadOpts.bf16_ntile_major = true at load time so
+    /// the weight matrices are stored in the N-tile-major layout.
+    use_bf16_ntile_major: bool = false,
 
     /// Configure the matmul thread count for subsequent forward passes.
     pub fn setThreads(self: *Model, n: usize) void {
@@ -354,6 +365,31 @@ pub const Model = struct {
     /// and O projections through pool.matmulBF16Auto.
     pub fn setPooledBF16Attn(self: *Model, enable: bool) void {
         self.use_pooled_bf16_attn = enable;
+    }
+
+    /// Lever-9: toggle the N-tile-major BF16 pool dispatch. Requires
+    /// LoadOpts.bf16_ntile_major = true at model load — without that,
+    /// the weight matrices are still in row-major layout and the new
+    /// kernel will produce garbage.
+    pub fn setBF16NtileMajor(self: *Model, enable: bool) void {
+        self.use_bf16_ntile_major = enable;
+    }
+
+    /// Dispatch a pooled BF16 matmul through the layout-appropriate pool
+    /// method (row-major matmulBF16Auto or lever-9 matmulBF16NtileMajorAuto).
+    inline fn dispatchBF16(
+        self: *const Model,
+        p: *thread_pool.Pool,
+        a: *const Matrix,
+        b: []const u16,
+        b_rows: usize,
+        b_cols: usize,
+        c: *Matrix,
+    ) thread_pool.Error!void {
+        if (self.use_bf16_ntile_major) {
+            return p.matmulBF16NtileMajorAuto(a, b, b_rows, b_cols, c, self.n_threads);
+        }
+        return p.matmulBF16Auto(a, b, b_rows, b_cols, c, self.n_threads);
     }
 
     /// Attach a persistent thread pool. Caller retains ownership; the pool
@@ -469,6 +505,21 @@ pub const Model = struct {
             }
         }
 
+        // Lever-9 weight repack: convert every BF16 weight matrix from
+        // row-major to N-tile-major layout in-place. Allocates a scratch
+        // buffer per matrix, swaps the data pointer, frees the old data.
+        if (opts.bf16_ntile_major) {
+            for (0..config.num_hidden_layers) |i| {
+                inline for (.{ "w_gateup_bf16", "w_gate_bf16", "w_up_bf16", "w_down_bf16", "w_qkv_bf16", "w_q_bf16", "w_k_bf16", "w_v_bf16", "w_o_bf16" }) |field_name| {
+                    if (@field(layers[i], field_name)) |old_raw| {
+                        const new_raw = try weights_mod.repackBF16ToNtileMajor(alloc, old_raw);
+                        alloc.free(old_raw.data);
+                        @field(layers[i], field_name) = new_raw;
+                    }
+                }
+            }
+        }
+
         const final_norm = try weights_mod.loadVectorBF16(alloc, st, "model.norm.weight");
         errdefer alloc.free(final_norm);
 
@@ -481,6 +532,15 @@ pub const Model = struct {
         else
             try weights_mod.loadMatrixBF16RawTransposed(alloc, st, "lm_head.weight");
         errdefer lm_head_bf16.deinit(alloc);
+
+        // Lever-9: lm_head also repacked when flag set, so the single-thread
+        // matmulBF16SIMD fallback in forward() will call the N-tile-major
+        // variant. We do this after the errdefer to keep cleanup simple.
+        if (opts.bf16_ntile_major) {
+            const new_lm_head = try weights_mod.repackBF16ToNtileMajor(alloc, lm_head_bf16);
+            alloc.free(lm_head_bf16.data);
+            lm_head_bf16 = new_lm_head;
+        }
 
         const rope_cache = try rope.RopeCache.init(
             alloc,
@@ -577,12 +637,12 @@ pub const Model = struct {
             if (attn_qkv_fused) {
                 const p = self.pool.?;
                 const qkvw = layer.w_qkv_bf16.?;
-                try p.matmulBF16Auto(&x, qkvw.data, qkvw.rows, qkvw.cols, &qkv_buf.?, self.n_threads);
+                try self.dispatchBF16(p, &x, qkvw.data, qkvw.rows, qkvw.cols, &qkv_buf.?);
             } else if (attn_bf16) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&x, layer.w_q_bf16.?.data, layer.w_q_bf16.?.rows, layer.w_q_bf16.?.cols, &q_buf.?, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_k_bf16.?.data, layer.w_k_bf16.?.rows, layer.w_k_bf16.?.cols, &k_buf.?, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_v_bf16.?.data, layer.w_v_bf16.?.rows, layer.w_v_bf16.?.cols, &v_buf.?, self.n_threads);
+                try self.dispatchBF16(p, &x, layer.w_q_bf16.?.data, layer.w_q_bf16.?.rows, layer.w_q_bf16.?.cols, &q_buf.?);
+                try self.dispatchBF16(p, &x, layer.w_k_bf16.?.data, layer.w_k_bf16.?.rows, layer.w_k_bf16.?.cols, &k_buf.?);
+                try self.dispatchBF16(p, &x, layer.w_v_bf16.?.data, layer.w_v_bf16.?.rows, layer.w_v_bf16.?.cols, &v_buf.?);
             } else {
                 try self.matmulDispatch(&x, &layer.w_q, &q_buf.?);
                 try self.matmulDispatch(&x, &layer.w_k, &k_buf.?);
@@ -665,7 +725,7 @@ pub const Model = struct {
             defer o_out.deinit(alloc);
             if (attn_bf16) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&attn_out, layer.w_o_bf16.?.data, layer.w_o_bf16.?.rows, layer.w_o_bf16.?.cols, &o_out, self.n_threads);
+                try self.dispatchBF16(p, &attn_out, layer.w_o_bf16.?.data, layer.w_o_bf16.?.rows, layer.w_o_bf16.?.cols, &o_out);
             } else {
                 try self.matmulDispatch(&attn_out, &layer.w_o, &o_out);
             }
@@ -711,11 +771,11 @@ pub const Model = struct {
             if (mlp_fused) {
                 const p = self.pool.?;
                 const gu = layer.w_gateup_bf16.?;
-                try p.matmulBF16Auto(&x, gu.data, gu.rows, gu.cols, &gateup_buf.?, self.n_threads);
+                try self.dispatchBF16(p, &x, gu.data, gu.rows, gu.cols, &gateup_buf.?);
             } else if (mlp_bf16) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&x, layer.w_gate_bf16.?.data, layer.w_gate_bf16.?.rows, layer.w_gate_bf16.?.cols, &gate_buf.?, self.n_threads);
-                try p.matmulBF16Auto(&x, layer.w_up_bf16.?.data, layer.w_up_bf16.?.rows, layer.w_up_bf16.?.cols, &up_buf.?, self.n_threads);
+                try self.dispatchBF16(p, &x, layer.w_gate_bf16.?.data, layer.w_gate_bf16.?.rows, layer.w_gate_bf16.?.cols, &gate_buf.?);
+                try self.dispatchBF16(p, &x, layer.w_up_bf16.?.data, layer.w_up_bf16.?.rows, layer.w_up_bf16.?.cols, &up_buf.?);
             } else {
                 try self.matmulDispatch(&x, &layer.w_gate, &gate_buf.?);
                 try self.matmulDispatch(&x, &layer.w_up, &up_buf.?);
@@ -752,7 +812,7 @@ pub const Model = struct {
 
             if (mlp_bf16) {
                 const p = self.pool.?;
-                try p.matmulBF16Auto(&down_input, layer.w_down_bf16.?.data, layer.w_down_bf16.?.rows, layer.w_down_bf16.?.cols, &down_out, self.n_threads);
+                try self.dispatchBF16(p, &down_input, layer.w_down_bf16.?.data, layer.w_down_bf16.?.rows, layer.w_down_bf16.?.cols, &down_out);
             } else {
                 try self.matmulDispatch(&down_input, &layer.w_down, &down_out);
             }
@@ -799,16 +859,13 @@ pub const Model = struct {
         // module for explicit callers but not wired here.
         const t_lm_start = if (inst != null) nowNs() else 0;
         if (self.use_pooled_bf16_lm_head) if (self.pool) |p| {
-            try p.matmulBF16Auto(
-                &x_last,
-                self.lm_head_bf16.data,
-                self.lm_head_bf16.rows,
-                self.lm_head_bf16.cols,
-                &logits_m,
-                self.n_threads,
-            );
+            try self.dispatchBF16(p, &x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
+        } else if (self.use_bf16_ntile_major) {
+            try matmul_bf16.matmulBF16SIMDNtileMajor(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
         } else {
             try matmul_bf16.matmulBF16SIMD(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
+        } else if (self.use_bf16_ntile_major) {
+            try matmul_bf16.matmulBF16SIMDNtileMajor(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
         } else {
             try matmul_bf16.matmulBF16SIMD(&x_last, self.lm_head_bf16.data, self.lm_head_bf16.rows, self.lm_head_bf16.cols, &logits_m);
         }

@@ -310,6 +310,115 @@ pub fn matmulBF16SIMDRegBlock(
     }
 }
 
+/// Lever-9 standalone — N-tile-major BF16 matmul (single-thread).
+///
+/// b layout: [n_tile_outer, K, n_tile_inner=TILE=64], flat index
+/// b[nt * K * TILE + k * TILE + i]. Stride between k iterations is
+/// TILE * 2 bytes = 128 bytes (2 cache lines) which the L2 hardware
+/// streamer engages, vs row-major's N * 2 byte stride which page-crosses.
+///
+/// Caller responsibility: weights must be pre-repacked to this layout
+/// at load time (see weights.zig loadMatrixBF16RawNtileMajor). Per-call
+/// arithmetic is identical to matmulBF16SIMDRegBlock; only the b read
+/// pattern changes.
+///
+/// On Ice Lake-U M=1 K=2048 N=11264 single-thread ReleaseFast this
+/// measured **1.29x** faster than matmulBF16SIMDRegBlock (4146 us → 3207 us).
+/// exp-1780110463-209781800.
+pub fn matmulBF16SIMDNtileMajor(
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+) Error!void {
+    if (a.cols != b_rows) return Error.DimensionMismatch;
+    if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
+    if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
+
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
+    const TILE = 4 * LANE; // 64
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+    const n_tiles = N / TILE;
+    const n_remainder = N - n_tiles * TILE;
+
+    @memset(c.data, 0.0);
+
+    var i: usize = 0;
+    while (i < M) : (i += 1) {
+        const a_row = a.data[i * K ..][0..K];
+        const c_row = c.data[i * N ..][0..N];
+        const shift: @Vector(16, u5) = @splat(16);
+
+        var nt: usize = 0;
+        while (nt < n_tiles) : (nt += 1) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+
+            const tile_base = nt * K * TILE;
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a_row[k]);
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
+            }
+
+            const c_base = nt * TILE;
+            c_row[c_base..][0..LANE].* = acc0;
+            c_row[c_base + LANE ..][0..LANE].* = acc1;
+            c_row[c_base + 2 * LANE ..][0..LANE].* = acc2;
+            c_row[c_base + 3 * LANE ..][0..LANE].* = acc3;
+        }
+
+        // Scalar fallback for N % TILE columns at the tail. The pre-repack
+        // stores them at offset n_tiles * K * TILE in row-major form
+        // (k * n_remainder + j), bit-for-bit consistent with the standalone
+        // loader.
+        if (n_remainder > 0) {
+            const tail_base = n_tiles * K * TILE;
+            const tail_c_base = n_tiles * TILE;
+            var j: usize = 0;
+            while (j < n_remainder) : (j += 1) {
+                var acc: f32 = 0.0;
+                var k: usize = 0;
+                while (k < K) : (k += 1) {
+                    const bv: f32 = @bitCast(@as(u32, b[tail_base + k * n_remainder + j]) << 16);
+                    acc += a_row[k] * bv;
+                }
+                c_row[tail_c_base + j] = acc;
+            }
+        }
+    }
+}
+
 /// Auto-dispatch BF16-weights matmul.
 ///
 /// On macOS (Apple Silicon), routes B-matrices with ≥1M elements through
