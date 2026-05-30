@@ -23,6 +23,25 @@ The 0.0.11 + lm_head pool median 100 at clean load is the standing best. Cumulat
 
 Note: lever-9 reported numbers (174 med) and lever-9 + lm_head pool (100 med) were re-benched at matched clean load; the 174 number was load-elevated from background processes during the initial release bench.
 
+## Lever-12 + Lever-13: blocked GEMM substrate (prefill M>=4)
+
+The decode-path numbers above measure M=1 throughput. For prefill
+(seq > 1) and batched serving (multiple requests), the comptime-blocked
+GEMM kernel kicks in at M >= 4. Microbench results at K=2048 N=2048:
+
+| Shape | ntile-1T | blk1-1T | blk4-1T (lever-12) | blk4-4T (lever-13) |
+|---|---|---|---|---|
+| M=1 decode | 2245 us | 2110 us | 2410 us | 2397 us (wash, decode uses lever-9) |
+| M=8 small batch | 17989 us | 14452 us | 8454 us (2.13x) | **3226 us (5.57x)** |
+| M=64 prefill | 113879 us | 74516 us | 23454 us (4.86x) | **22354 us (5.09x)** |
+
+The M-block win compounds with col-split most at small-to-medium M
+(M=8: 2.6x col-split add). At large M (M=64), single-thread blocked
+is already memory-bandwidth bound — col-split adds only 1.05x.
+
+Net: at M=8-32 batched-serving prefill, the substrate gives 5-6x
+throughput improvement vs lever-9 single-thread baseline.
+
 ## Lever-9 per-region (n=4 threads, load ~14)
 
 | Region | ms (5-round med, prefill+15 decode) | share | vs lever-5 |

@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.0.13 — 2026-05-30
+
+**Lever-13: col-split + M-block blocked GEMM (5.57x prefill at M=8).**
+
+Per-thread `matmulBF16BlockedColRangeKernel` adds tile-range
+parallelism on top of lever-12's M-block. New WorkKind variant
+`bf16_blocked_col_split`. `Pool.matmulBF16BlockedAuto` now multi-
+threads the M-block path; M=1..3 still routes to lever-9 ntile-major.
+
+Microbench K=2048 N=2048:
+```
+  shape          | ntile-1T | blk4-1T | blk4-4T | total speedup
+  M=8 small      |  17989   |   8454  |  3226   | 5.57x
+  M=64 prefill   | 113879   |  23454  | 22354   | 5.09x
+```
+
+At M=8 the col-split adds 2.6x over single-thread blocked. At M=64
+it adds only 1.05x — single-thread blocked is already memory-
+bandwidth bound at that M. Sweet spot for the combined lever is
+M=8-32 (realistic batched serving prefill).
+
+91/91 tests pass. exp-1780158115-315311933 refuted on the M=64
+specific hypothesis (target 1.5x or more vs single-thread blocked,
+observed 1.05x), but the substrate produces 5.57x at M=8 — useful
+for batched serving regardless.
+
+## 0.0.12 — 2026-05-30
+
+**Lever-12: comptime-blocked GEMM substrate (3.04x prefill at M=64).**
+
+New substrate primitive `matmulBF16SIMDBlocked(M_BLOCK, N_TILE, K_TILE)`
+in `src/kernels/matmul_bf16.zig` — comptime-parameterized BLAS-style
+2-level blocked GEMM consuming the N-tile-major layout from lever-9.
+
+Schedule (M-block × N-tile × K-tile):
+```
+for n_tile in 0..N/64:
+  accs[M_BLOCK][4] = 0
+  for k_tile in 0..K step K_TILE:
+    for k in k_tile..k_tile+K_TILE:
+      load b[n_tile][k][0..64]      # 4 ZMM shared across M
+      inline for m in 0..M_BLOCK:
+        a_scalar = splat(a[m, k])
+        inline for t in 0..4:
+          accs[m][t] = fmadd(a_scalar, b[t], accs[m][t])
+  store c[m_base..m_base+M_BLOCK, n_tile..n_tile+64]
+```
+
+Each b cache-line load is consumed M_BLOCK times before the next
+b load. With M_BLOCK=4 N_TILE=64: 16 acc ZMM + 4 b ZMM + 4 a splats
++ 1 shift = 25 ZMM (fits Ice Lake 32-ZMM file).
+
+Microbench K=2048 N=2048 single-thread:
+```
+  M=1   ntile  1118 us  →  blk4  1911 us  (0.59x — decode wastes 3 rows)
+  M=8   ntile  7092 us  →  blk4  2886 us  (2.46x)
+  M=64  ntile 64866 us  →  blk4 21344 us  (3.04x)
+```
+
+Production dispatch: M=1 routes to lever-9; M >= 4 routes to
+blocked(4). exp-1780157294-563607188 confirmed (target 2x at M=64;
+observed 3.04x).
+
+Native Zig features:
+- comptime M_BLOCK, N_TILE, K_TILE — compiler specializes per shape
+- `inline for` over M_BLOCK and tile-index — straight-line fmadd
+- @Vector(16, f32) + @mulAdd → VFMADD231PS emission
+- @bitCast for BF16 → F32 widening after u32 shift
+
+Reusable substrate primitive across any future Zig BLAS-class matmul
+project (GEMM, conv lowering, attention kernels).
+
 ## 0.0.11 — 2026-05-29
 
 **Lever-9 + Lever-10b (lm_head pool re-flip): 6.17x cumulative decode.**
