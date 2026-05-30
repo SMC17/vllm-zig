@@ -183,6 +183,11 @@ pub fn repackBF16ToNtileMajor(
     const out = try alloc.alloc(u16, K * N);
     errdefer alloc.free(out);
 
+    // (Lever-11 MADV_HUGEPAGE attempt exp-1780156185-246065412 — refuted.
+    // System-level transparent_hugepage=always already auto-promotes large
+    // anonymous allocations; explicit hint adds no benefit. Comment locks
+    // in the negative result for future sessions.)
+
     var nt: usize = 0;
     while (nt < n_tiles) : (nt += 1) {
         var k: usize = 0;
