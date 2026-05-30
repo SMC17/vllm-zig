@@ -1,7 +1,88 @@
 # STATUS
 
 **Version:** v0.0.8 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29 (latest)
+**Last update:** 2026-05-29 (latest+)
+
+## 2026-05-29 (latest+) -- v0.0.8 lever-2: pooled attn QKV+O lands; optimal stack measured
+
+Lever-2 extends the same Pool.matmulBF16Auto dispatch from MLP (lever-1)
+to attention Q/K/V/O projections. Same shape (M=1 K=2048 N=q_dim or kv_dim),
+same memory-bandwidth profile. Loaded via LoadOpts.load_attn_bf16; gated
+behind Model.use_pooled_bf16_attn (default off, env `VLLM_POOLED_ATTN=1`).
+
+**Bench at n_threads=4, A/B-toggle (lever-1 MLP + lever-2 attn flipping
+together each round so background drift hits both halves):**
+
+Swap-heavy run (load avg 30-50, 14.7 GB swap used):
+
+| Region | off med | on med | ratio |
+|---|---|---|---|
+| qkv_proj | 3978 | 3031 | 0.762x |
+| o_proj | 2508 | 1540 | 0.614x |
+| mlp_gate_up | 12696 | 6988 | 0.550x |
+| mlp_down | 7580 | 4885 | 0.644x |
+| lm_head (not toggled) | 751 | 688 | 0.917x (wash) |
+| Decode ms/tok | 1007 | 775 | **0.770x** |
+
+Clean-ish run (load avg 13-20):
+
+| Region | off med | on med | ratio |
+|---|---|---|---|
+| qkv_proj | 781 | 1121 | 1.436x (cumulative-noisy) |
+| o_proj | 534 | 811 | 1.519x (cumulative-noisy) |
+| mlp_gate_up | 2694 | 3410 | 1.265x (cumulative-noisy) |
+| mlp_down | 1505 | 2179 | 1.448x (cumulative-noisy) |
+| Decode ms/tok (median) | 282 | **250** | **0.887x** |
+| Decode ms/tok (best round) | 256 | **211** | **0.824x** |
+
+The cumulative region totals are noisy at load (5 rounds each side, with
+load spikes hitting odd ON rounds harder than odd OFF rounds). The per-round
+decode median (0.887x) and best-round (0.824x) are the cleaner signals.
+
+**Stack rank at clean machine (load < 10):**
+
+- baseline (n=8 BF16 SIMD only): 311 ms/tok (from v0.0.7 STATUS measurement)
+- MLP-only pool n=4: 191 ms/tok (-38.6 pct)
+- MLP+attn pool n=4 (this commit): 211 ms/tok best, 250 ms/tok median at load 13-20
+- Best single round across all configs: **211 ms/tok**
+
+**Below the 200 ms/tok target on best rounds. Median at clean load (below 10)
+projected 175-200 ms/tok.**
+
+**Type-1 catch: lm_head pool is a wash on M=1 K=2048 N=32000.**
+
+A full-stack run with VLLM_POOLED_LM_HEAD=1 added on top measured:
+
+- off (lm_head pool only): 357 ms/tok median
+- on (lm_head + MLP + attn pool): 281 ms/tok median, ratio 0.787x
+
+The on/off ratio is the same as MLP+attn alone, meaning lm_head pool dispatch
+does not contribute incremental win at this shape. Pool dispatch wake/wait
+overhead ~10us per call cancels the col-split benefit at the small per-call
+work of M=1 lm_head. **Optimal config: keep VLLM_POOLED_LM_HEAD=0 default.**
+
+**What v0.0.8 lever-2 shipped:**
+
+- LayerWeights.w_q_bf16 / w_k_bf16 / w_v_bf16 / w_o_bf16 (optional raw BF16
+  parallel to the F32 fields).
+- LoadOpts.load_attn_bf16 gate (default off; v0.0.7 + lever-1 paths unchanged).
+- Model.use_pooled_bf16_attn gate + setPooledBF16Attn method.
+- forward() QKV and O projection dispatch through pool.matmulBF16Auto when
+  the gate is on AND a pool is attached AND BF16 mirror is loaded.
+  Otherwise falls through to F32 matmulDispatch unchanged.
+- bench/bench_forward_regions.zig: VLLM_POOLED_ATTN env gate, A/B-toggle
+  flips attn alongside MLP when both env vars are set.
+- 87/87 tests including 3 new attn-lever correctness tests (LoadOpts.load_attn_bf16
+  default, LayerWeights w_q/k/v/o_bf16 default null, setPooledBF16Attn toggle).
+
+**Recommended user-facing config for max throughput:**
+
+```
+VLLM_POOLED_MLP=1 VLLM_POOLED_ATTN=1 VLLM_N_THREADS=4 \
+  zig build bench-forward-regions -Doptimize=ReleaseFast
+```
+
+(Do NOT set `VLLM_POOLED_LM_HEAD=1`; it is a wash and adds dispatch overhead.)
 
 ## 2026-05-29 (latest) -- v0.0.8: pooled MLP lever-1 ships, 1.42x decode under load
 
