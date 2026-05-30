@@ -568,6 +568,11 @@ fn matmulBF16ColRangeKernel(
 
         // 4-ZMM register-blocked main loop: 64 cols per tile, accumulators
         // stay in registers across K, single store at tile end.
+        // (Lever-6 manual prefetch attempted exp-1780108992-833810307 —
+        // refuted: 2x regression across all regions because @prefetch
+        // locality=3 in the inner K loop thrashes L1 across 4 worker
+        // threads and fights Ice Lake's L2 streamer. Hardware prefetcher
+        // already saturates this access pattern.)
         var j = col_start;
         while (j < j_tile_end) : (j += TILE) {
             var acc0: Vec_f32 = @splat(0.0);
