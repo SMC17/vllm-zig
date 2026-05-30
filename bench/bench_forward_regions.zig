@@ -125,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     model.setPooledBF16LMHead(pool_lm_on);
     // Initial MLP state. In A/B mode this gets flipped per round below.
     model.setPooledBF16MLP(pool_mlp_on);
+    model.setPooledBF16Attn(pool_attn_on);
 
     const prompt = "The capital of France is";
     const ids = try tok.encode(alloc, prompt);
@@ -146,10 +147,13 @@ pub fn main(init: std.process.Init) !void {
     var round: usize = 0;
     while (round < n_rounds) : (round += 1) {
         // In A/B mode, alternate odd=on / even=off so background load
-        // drift hits both halves with equal weight.
+        // drift hits both halves with equal weight. When pool_attn_on
+        // is also set the attn flag toggles alongside MLP so the
+        // measured ratio reflects the FULL stacked lever, not just MLP.
         if (ab_toggle) {
             const on = (round % 2) == 1;
             model.setPooledBF16MLP(on);
+            if (pool_attn_on) model.setPooledBF16Attn(on);
             round_mlp_on[round] = on;
         } else {
             round_mlp_on[round] = pool_mlp_on;
