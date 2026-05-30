@@ -18,6 +18,7 @@ const vllm = @import("vllm");
 const Matrix = vllm.Matrix;
 const matmul_bf16 = vllm.matmul_bf16;
 const weights = vllm.weights;
+const Pool = vllm.Pool;
 
 const TILE: usize = 64;
 const ITERS: usize = 30;
@@ -60,12 +61,18 @@ fn benchShape(alloc: std.mem.Allocator, io: std.Io, shape: Shape) !void {
     defer c_blk1.deinit(alloc);
     var c_blk4 = try Matrix.init(alloc, M, N);
     defer c_blk4.deinit(alloc);
+    var c_pool = try Matrix.init(alloc, M, N);
+    defer c_pool.deinit(alloc);
+
+    var pool = try Pool.init(alloc, 4);
+    defer pool.deinit();
 
     // Warmup
     for (0..5) |_| {
         try matmul_bf16.matmulBF16SIMDNtileMajor(&a, b_nt.data, K, N, &c_ntile);
         try matmul_bf16.matmulBF16SIMDBlocked(1, 64, 64, &a, b_nt.data, K, N, &c_blk1);
         try matmul_bf16.matmulBF16SIMDBlocked(4, 64, 64, &a, b_nt.data, K, N, &c_blk4);
+        try pool.matmulBF16BlockedAuto(&a, b_nt.data, K, N, &c_pool, 4);
     }
 
     const t0 = std.Io.Clock.awake.now(io);
@@ -86,22 +93,28 @@ fn benchShape(alloc: std.mem.Allocator, io: std.Io, shape: Shape) !void {
     }
     const ns_b4: u64 = @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
 
-    const ms_nt = ns_nt / ITERS / 1_000_000;
+    const t3 = std.Io.Clock.awake.now(io);
+    for (0..ITERS) |_| {
+        try pool.matmulBF16BlockedAuto(&a, b_nt.data, K, N, &c_pool, 4);
+    }
+    const ns_pool: u64 = @intCast(t3.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+
     const us_nt = ns_nt / ITERS / 1_000;
     const us_b1 = ns_b1 / ITERS / 1_000;
     const us_b4 = ns_b4 / ITERS / 1_000;
-    _ = ms_nt;
+    const us_pool = ns_pool / ITERS / 1_000;
 
     const speedup_b1 = @as(f64, @floatFromInt(ns_nt)) / @as(f64, @floatFromInt(ns_b1));
     const speedup_b4 = @as(f64, @floatFromInt(ns_nt)) / @as(f64, @floatFromInt(ns_b4));
+    const speedup_pool = @as(f64, @floatFromInt(ns_nt)) / @as(f64, @floatFromInt(ns_pool));
 
-    // Per-row throughput (rows-per-second) — useful for prefill comparison.
+    // Per-row throughput (rows-per-second).
     const rows_per_sec_nt: u64 = @intFromFloat(@as(f64, @floatFromInt(M * ITERS)) * 1.0e9 / @as(f64, @floatFromInt(ns_nt)));
-    const rows_per_sec_b4: u64 = @intFromFloat(@as(f64, @floatFromInt(M * ITERS)) * 1.0e9 / @as(f64, @floatFromInt(ns_b4)));
+    const rows_per_sec_pool: u64 = @intFromFloat(@as(f64, @floatFromInt(M * ITERS)) * 1.0e9 / @as(f64, @floatFromInt(ns_pool)));
 
     std.debug.print(
-        "  {s} K={d:>4} N={d:>4} | ntile {d:>6} us | blocked(1,64,64) {d:>6} us ({d:.2}x) | blocked(4,64,64) {d:>6} us ({d:.2}x) | rows/s ntile {d:>7} vs blocked4 {d:>7}\n",
-        .{ shape.label, K, N, us_nt, us_b1, speedup_b1, us_b4, speedup_b4, rows_per_sec_nt, rows_per_sec_b4 },
+        "  {s} K={d:>4} N={d:>4} | ntile-1T {d:>6} us | blk1-1T {d:>6} ({d:.2}x) | blk4-1T {d:>6} ({d:.2}x) | blk4-4T {d:>6} ({d:.2}x) | rows/s nt-1T {d:>7} vs blk4-4T {d:>7}\n",
+        .{ shape.label, K, N, us_nt, us_b1, speedup_b1, us_b4, speedup_b4, us_pool, speedup_pool, rows_per_sec_nt, rows_per_sec_pool },
     );
 }
 

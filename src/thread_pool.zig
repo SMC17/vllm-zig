@@ -52,6 +52,7 @@ const WorkKind = enum(u32) {
     bf16_row_split = 4,
     bf16_col_split = 5,
     bf16_ntile_col_split = 6, // lever-9: N-tile-major layout, per-thread tile range
+    bf16_blocked_col_split = 7, // lever-13: M-blocked + col-split prefill kernel
 };
 
 const Job = struct {
@@ -275,11 +276,19 @@ pub const Pool = struct {
             return self.matmulBF16NtileMajorAuto(a, b, b_rows, b_cols, c, n_workers);
         }
 
-        // For M >= 4 prefill, dispatch the blocked kernel single-thread.
-        // Multi-thread col-split for blocked is left for follow-up; the
-        // single-thread blocked path at M=64 is already 3x faster than the
-        // multi-thread ntile path because b reuse dominates.
-        matmul_bf16_kernels.matmulBF16SIMDBlocked(4, 64, 64, a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+        // For M >= 4 prefill: lever-13 col-split + M-block.
+        const TILE: usize = 64;
+        const N = b_cols;
+        const n_tiles = N / TILE;
+        const T = @min(@min(n_workers, n_tiles), self.threads.len);
+        if (T <= 1) {
+            matmul_bf16_kernels.matmulBF16SIMDBlocked(4, 64, 64, a, b, b_rows, b_cols, c) catch return Error.DimensionMismatch;
+            return;
+        }
+
+        @memset(c.data, 0.0);
+        const tile_chunk = (n_tiles + T - 1) / T;
+        try self.submitBF16(.bf16_blocked_col_split, a, b, b_rows, b_cols, c, T, fillTileRanges, .{ tile_chunk, n_tiles });
     }
 
     /// Lever-9: N-tile-major BF16 matmul via col-split. Each thread owns
@@ -466,6 +475,15 @@ fn workerLoop(pool: *Pool, id: usize) void {
                             range[1],
                         ),
                         .bf16_ntile_col_split => if (pool.job.b_bf16) |bb| matmulBF16NtileColRangeKernel(
+                            a,
+                            bb,
+                            pool.job.b_bf16_rows,
+                            pool.job.b_bf16_cols,
+                            c,
+                            range[0],
+                            range[1],
+                        ),
+                        .bf16_blocked_col_split => if (pool.job.b_bf16) |bb| matmulBF16BlockedColRangeKernel(
                             a,
                             bb,
                             pool.job.b_bf16_rows,
@@ -728,6 +746,124 @@ fn matmulBF16ColRangeKernel(
                 acc += a_row[k] * bv;
             }
             c_row[j] = acc;
+        }
+    }
+}
+
+/// Lever-13: per-thread M-blocked + col-split blocked GEMM kernel.
+/// Each thread owns tile indices [tile_start, tile_end) and runs the
+/// lever-12 schedule on its slice. Caller is responsible for c being
+/// pre-zeroed and for a.rows >= M_BLOCK (typically M_BLOCK=4 at prefill).
+/// Tail rows (M % M_BLOCK) handled inline.
+fn matmulBF16BlockedColRangeKernel(
+    a: *const Matrix,
+    b: []const u16,
+    b_rows: usize,
+    b_cols: usize,
+    c: *Matrix,
+    tile_start: usize,
+    tile_end: usize,
+) void {
+    _ = b_rows;
+    const M_BLOCK: usize = 4;
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
+    const TILE = 4 * LANE; // 64
+
+    const M = a.rows;
+    const N = b_cols;
+    const K = a.cols;
+    const m_block_end = (M / M_BLOCK) * M_BLOCK;
+
+    // M_BLOCK-row pass over [tile_start, tile_end) tiles.
+    var m_base: usize = 0;
+    while (m_base < m_block_end) : (m_base += M_BLOCK) {
+        var nt: usize = tile_start;
+        while (nt < tile_end) : (nt += 1) {
+            var accs: [M_BLOCK][4]Vec_f32 = undefined;
+            inline for (0..M_BLOCK) |m| inline for (0..4) |t| {
+                accs[m][t] = @splat(0.0);
+            };
+            const tile_base = nt * K * TILE;
+            const shift: @Vector(16, u5) = @splat(16);
+
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                inline for (0..M_BLOCK) |m| {
+                    const a_scalar: Vec_f32 = @splat(a.data[(m_base + m) * K + k]);
+                    accs[m][0] = @mulAdd(Vec_f32, a_scalar, b0_f32, accs[m][0]);
+                    accs[m][1] = @mulAdd(Vec_f32, a_scalar, b1_f32, accs[m][1]);
+                    accs[m][2] = @mulAdd(Vec_f32, a_scalar, b2_f32, accs[m][2]);
+                    accs[m][3] = @mulAdd(Vec_f32, a_scalar, b3_f32, accs[m][3]);
+                }
+            }
+
+            const c_base = nt * TILE;
+            inline for (0..M_BLOCK) |m| {
+                const c_row = c.data[(m_base + m) * N ..][0..N];
+                c_row[c_base..][0..LANE].* = accs[m][0];
+                c_row[c_base + LANE ..][0..LANE].* = accs[m][1];
+                c_row[c_base + 2 * LANE ..][0..LANE].* = accs[m][2];
+                c_row[c_base + 3 * LANE ..][0..LANE].* = accs[m][3];
+            }
+        }
+    }
+
+    // Tail rows M % M_BLOCK over [tile_start, tile_end) tiles.
+    while (m_base < M) : (m_base += 1) {
+        var nt: usize = tile_start;
+        while (nt < tile_end) : (nt += 1) {
+            var acc0: Vec_f32 = @splat(0.0);
+            var acc1: Vec_f32 = @splat(0.0);
+            var acc2: Vec_f32 = @splat(0.0);
+            var acc3: Vec_f32 = @splat(0.0);
+            const tile_base = nt * K * TILE;
+            const shift: @Vector(16, u5) = @splat(16);
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const a_scalar: Vec_f32 = @splat(a.data[m_base * K + k]);
+                const b_row = b[tile_base + k * TILE ..][0..TILE];
+                const b0_u16: Vec_u16 = b_row[0..LANE].*;
+                const b1_u16: Vec_u16 = b_row[LANE..][0..LANE].*;
+                const b2_u16: Vec_u16 = b_row[2 * LANE ..][0..LANE].*;
+                const b3_u16: Vec_u16 = b_row[3 * LANE ..][0..LANE].*;
+                const b0_u32: Vec_u32 = b0_u16;
+                const b1_u32: Vec_u32 = b1_u16;
+                const b2_u32: Vec_u32 = b2_u16;
+                const b3_u32: Vec_u32 = b3_u16;
+                const b0_f32: Vec_f32 = @bitCast(b0_u32 << shift);
+                const b1_f32: Vec_f32 = @bitCast(b1_u32 << shift);
+                const b2_f32: Vec_f32 = @bitCast(b2_u32 << shift);
+                const b3_f32: Vec_f32 = @bitCast(b3_u32 << shift);
+
+                acc0 = @mulAdd(Vec_f32, a_scalar, b0_f32, acc0);
+                acc1 = @mulAdd(Vec_f32, a_scalar, b1_f32, acc1);
+                acc2 = @mulAdd(Vec_f32, a_scalar, b2_f32, acc2);
+                acc3 = @mulAdd(Vec_f32, a_scalar, b3_f32, acc3);
+            }
+
+            const c_base = nt * TILE;
+            const c_row = c.data[m_base * N ..][0..N];
+            c_row[c_base..][0..LANE].* = acc0;
+            c_row[c_base + LANE ..][0..LANE].* = acc1;
+            c_row[c_base + 2 * LANE ..][0..LANE].* = acc2;
+            c_row[c_base + 3 * LANE ..][0..LANE].* = acc3;
         }
     }
 }
