@@ -1,7 +1,62 @@
 # STATUS
 
-**Version:** v0.0.8 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29 (latest+)
+**Version:** v0.0.10 (toy batch-1 generator; **NOT vLLM-equivalent**)
+**Last update:** 2026-05-29 (latest+5)
+
+## 2026-05-29 (latest+5) -- v0.0.10 lever-5: register-blocked BF16 kernel, 2.23x decode
+
+`matmulBF16SIMDRegBlock` and the pool's `matmulBF16ColRangeKernel`
+swap from outer-product (K outer, N inner over c) to inner-product
+(N outer in 64-column tiles, K inner with 4 ZMM accumulators held live
+across the full K loop).
+
+Memory traffic on M=1 K=2048 N=2048:
+- outer-product: K*N c-reads + K*N c-writes (4M ops to c)
+- inner-product: N c-stores per tile (32 stores total)
+
+The K-fold reduction in c-traffic was the dominant cost in the old
+SIMD path. Accumulators stay in `@Vector(16, f32)` ZMMs via `@mulAdd`
+(FMA, one rounding) rather than separate mul+add (two roundings).
+
+**Bench (5 rounds, n_threads=4, full lever-1..5 stack):**
+
+```
+  metric         | lever-4 (load 22) | lever-5 (load 18) | speedup
+  ---------------+-------------------+-------------------+--------
+  decode med     |        617        |        277        |  2.23x
+  decode p10     |        473        |        263        |  1.80x
+  decode p90     |        660        |        311        |  2.12x
+```
+
+**Per-region (med ms across 5 rounds of prefill + 15 decode steps):**
+
+```
+  region        | lever-4 | lever-5 | speedup
+  --------------+---------+---------+--------
+  mlp_gate_up   |   4709  |   2361  |  1.99x
+  mlp_down      |   3435  |   1261  |  2.72x
+  qkv_proj      |   1740  |    558  |  3.12x
+  o_proj        |   1417  |    474  |  2.99x
+  lm_head       |    518  |    295  |  1.76x
+```
+
+Numerical equivalence within 6.7e-6 max_abs on M=1 K=2048 N=32000 lm_head
+shape; relative diff bounded by FMA-vs-separate-rounding gap at K=2048
+accumulation. 89/89 tests pass. exp-1780108119-609312875 confirmed.
+
+**Honest refuted attempts (Type-I prevention) on top of lever-5:**
+
+| Lever | Verdict | exp ID | Mechanism |
+|---|---|---|---|
+| 6 — manual `@prefetch` in inner K | refuted (2x regression) | exp-1780108992-833810307 | Fights Ice Lake L2 hardware streamer; L1 thrashing across 4 worker threads |
+| 7 — pooled lm_head re-test | inconclusive | exp-1780109335-555121691 | lm_head region improved 3.7pct but other regions regressed 17-24pct |
+| 7 alt — VLLM_N_THREADS=8 | refuted (+1.8pct worse) | exp-1780109647-402094155 | Futex sync overhead scales with worker count |
+| 8 — N_TILE=128 (8 ZMM acc) | refuted (+25pct p90) | exp-1780109796-369194807 | Ice Lake L1 read-port (2 loads/cycle), not ZMM count, is the limit |
+
+Lever-5 establishes a local Pareto frontier at the col-range kernel
+level. Further wins require structural changes (weight layout reorg
+to N-tile-major for stride-1 thread access, fused MLP block streaming
+gate+up+silu+mul+down, or sparsity/int8 quantization).
 
 ## 2026-05-29 (latest+) -- v0.0.8 lever-2: pooled attn QKV+O lands; optimal stack measured
 
