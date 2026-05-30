@@ -1,7 +1,70 @@
 # STATUS
 
-**Version:** v0.0.10 (toy batch-1 generator; **NOT vLLM-equivalent**)
-**Last update:** 2026-05-29 (latest+5)
+**Version:** v0.0.11 (toy batch-1 generator; **NOT vLLM-equivalent**)
+**Last update:** 2026-05-29 (latest+6)
+
+## 2026-05-29 (latest+6) -- v0.0.11 lever-9: N-tile-major BF16 layout, 1.59x over lever-5 (3.55x cumulative)
+
+Re-packs every BF16 weight matrix at load time into the
+`[N_tile_outer, K, N_tile_inner=64]` layout consumed by a new
+col-range kernel `matmulBF16NtileColRangeKernel`. The inner K loop
+sees stride-1 b reads within tiles instead of stride-N row-major.
+
+Stride-N row-major was the silent bandwidth ceiling for lever-1
+through lever-5. Lever-9 broke through it.
+
+**Bench (5 rounds, n_threads=4, full lever stack 1-9):**
+
+```
+  metric        | lever-5 (load 18) | lever-9 (load ~14) | speedup
+  --------------+-------------------+--------------------+--------
+  decode med    |        277        |        174         |  1.59x
+  decode p10    |        263        |        164         |  1.60x
+  decode p90    |        311        |        207         |  1.50x
+```
+
+**Per-region (med ms across 5 rounds of prefill + 15 decode steps):**
+
+```
+  region        | lever-5 | lever-9 | speedup
+  --------------+---------+---------+--------
+  mlp_gate_up   |   2361  |   1706  |  1.38x
+  mlp_down      |   1261  |    899  |  1.40x
+  qkv_proj      |    558  |    451  |  1.24x
+  o_proj        |    474  |    349  |  1.36x
+  lm_head       |    295  |    241  |  1.22x
+```
+
+Cumulative from v0.0.9 lever-4 (med 617 at load 22): **3.55x decode**.
+
+89/89 tests pass. exp-1780110463-209781800 confirmed (target was
+20pct decode improvement; observed 37pct over lever-5 alone).
+
+**Mechanism (key finding for future kernel work):**
+
+The stride between successive k iterations on b:
+- row-major: `N * 2` bytes = 22.5 KB (N=11264) → page-crosses every iter
+- N-tile-major: `TILE * 2` = 128 bytes (TILE=64) → 2 cache lines, L2 streamer engages
+
+The Ice Lake hardware streamer cannot detect strides beyond a few cache
+lines. Row-major's 22.5 KB stride was far past its horizon, leaving
+each k iteration to stall on TLB miss + DRAM round-trip. N-tile-major's
+128-byte stride is squarely within streamer range.
+
+This explains why no kernel-level tweak inside the lever-5 col-range
+kernel (refuted lever-6 prefetch, refuted lever-8 N_TILE=128) could
+break the ceiling — they all left the row-major stride-N b access
+pattern intact. The layout was the bottleneck, not the kernel.
+
+**Optimal env-var config (v0.0.11):**
+
+```
+VLLM_BF16_NTILE_MAJOR=1 \
+VLLM_POOLED_MLP=1 VLLM_POOLED_ATTN=1 \
+VLLM_POOLED_MLP_FUSED=1 VLLM_QKV_FUSED=1 \
+VLLM_N_THREADS=4 \
+  zig build bench-forward-regions -Doptimize=ReleaseFast
+```
 
 ## 2026-05-29 (latest+5) -- v0.0.10 lever-5: register-blocked BF16 kernel, 2.23x decode
 

@@ -14,32 +14,32 @@ All measurements: prefill 1 prompt + decode 16 tokens, 5 rounds, median reported
 | 0.0.7 | lever-1 pooled MLP | 297 | 275 | n/a | <10 |
 | 0.0.8 | lever-2 + lever-3 pool+fuse | 250 | **211** | n/a | ~10 |
 | 0.0.9 | lever-4 QKV fusion | (inconclusive) | n/a | n/a | 22-28 |
-| **0.0.10** | **lever-5 reg-blocked kernel** | **277** | **263** | **311** | **18** |
+| 0.0.10 | lever-5 reg-blocked kernel | 277 | 263 | 311 | 18 |
+| **0.0.11** | **lever-9 N-tile-major layout** | **174** | **164** | **207** | **~14** |
 
-The 0.0.10 median 277 at load 18 supersedes prior measurements. At matched clean load it projects below 200 ms/tok; the lever-5 register-blocked kernel halves K*N c-traffic in the BF16 col-range dispatch.
+The 0.0.11 median 174 at load 14 supersedes prior measurements. Cumulative improvement from v0.0.9 lever-4 baseline (med 617): **3.55x**.
 
-## Lever-5 per-region (clean machine, n=4 threads)
+## Lever-9 per-region (n=4 threads, load ~14)
 
-| Region | ms (5-round med, prefill+15 decode) | share |
-|---|---|---|
-| mlp_gate_up (fused gate+up) | 2361 | 47.0 percent |
-| mlp_down | 1261 | 25.1 percent |
-| qkv_proj (fused QKV) | 558 | 11.1 percent |
-| o_proj | 474 | 9.4 percent |
-| lm_head | 295 | 5.9 percent |
-| attention (kernel) | 47 | 0.9 percent |
-| silu_mul | 62 | 1.2 percent |
-| everything else | 6 | <1 percent |
+| Region | ms (5-round med, prefill+15 decode) | share | vs lever-5 |
+|---|---|---|---|
+| mlp_gate_up (fused gate+up) | 1706 | 45.2 percent | 1.38x |
+| mlp_down | 899 | 23.8 percent | 1.40x |
+| qkv_proj (fused QKV) | 451 | 12.0 percent | 1.24x |
+| o_proj | 349 | 9.3 percent | 1.36x |
+| lm_head | 241 | 6.4 percent | 1.22x |
+| attention (kernel) | 48 | 1.3 percent | flat |
+| silu_mul | 65 | 1.7 percent | flat |
+| everything else | 17 | <1 percent | flat |
 
-MLP still dominates at 72 percent. Lever-5 hits all five BF16 matmul regions through the shared `matmulBF16ColRangeKernel`; per-region speedups vs 0.0.9 lever-4 are 1.76x to 3.12x.
+Lever-9 hits all five BF16 matmul regions through the layout change at load time. The MLP still dominates at 69 percent, but the absolute MLP time is down from 3622 to 2605 ms (1.39x).
 
-## Optimal env-var config
+## Optimal env-var config (v0.0.11)
 
 ```
-VLLM_POOLED_MLP=1 \
-VLLM_POOLED_ATTN=1 \
-VLLM_POOLED_MLP_FUSED=1 \
-VLLM_QKV_FUSED=1 \
+VLLM_BF16_NTILE_MAJOR=1 \
+VLLM_POOLED_MLP=1 VLLM_POOLED_ATTN=1 \
+VLLM_POOLED_MLP_FUSED=1 VLLM_QKV_FUSED=1 \
 VLLM_N_THREADS=4 \
   zig build bench-forward-regions -Doptimize=ReleaseFast
 ```

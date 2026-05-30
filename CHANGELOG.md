@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.0.11 — 2026-05-29
+
+**Lever-9: N-tile-major BF16 weight layout (3.55x cumulative decode).**
+
+Re-packs every BF16 weight matrix at load time into the
+`[N_tile_outer, K, N_tile_inner=64]` layout consumed by a new col-range
+kernel `matmulBF16NtileColRangeKernel`. The inner K loop now sees
+stride-1 b reads within tiles instead of the previous stride-N pattern
+that page-crossed every k iteration.
+
+```
+  k-stride row-major (lever-5):  N * 2 = 22.5 KB  → page cross, TLB miss
+  k-stride N-tile-major (lever-9): TILE * 2 = 128 B → L2 streamer engages
+```
+
+Ice Lake L2 hardware streamer detects the stride-128 pattern within
+a tile and prefetches ahead; row-major's stride-N pattern was beyond
+its detection horizon, leaving each k iteration to stall on TLB miss
+plus DRAM round-trip.
+
+End-to-end on TinyLlama-1.1B-Chat (5 rounds, n_threads=4, full lever
+stack 1-9, ReleaseFast):
+
+```
+  metric        | lever-5 (load 18) | lever-9 (load ~14) | speedup
+  --------------+-------------------+--------------------+--------
+  decode med    |        277        |        174         |  1.59x
+  decode p10    |        263        |        164         |  1.60x
+  decode p90    |        311        |        207         |  1.50x
+```
+
+Per-region (decode + prefill, 5 rounds, med ms):
+
+```
+  region        | lever-5 | lever-9 | speedup
+  --------------+---------+---------+--------
+  mlp_gate_up   |   2361  |   1706  |  1.38x
+  mlp_down      |   1261  |    899  |  1.40x
+  qkv_proj      |    558  |    451  |  1.24x
+  o_proj        |    474  |    349  |  1.36x
+  lm_head       |    295  |    241  |  1.22x
+```
+
+Cumulative from v0.0.9 lever-4 baseline (med 617): **3.55x** decode.
+
+89/89 tests pass. exp-1780110463-209781800 confirmed (target was
+20pct improvement; observed 37pct over lever-5 alone).
+
+New files / fields:
+- `src/weights.zig`: `repackBF16ToNtileMajor` repack helper.
+- `src/kernels/matmul_bf16.zig`: `matmulBF16SIMDNtileMajor` standalone.
+- `src/thread_pool.zig`: `matmulBF16NtileMajorAuto` + `matmulBF16NtileColRangeKernel`.
+- `src/model.zig`: `LoadOpts.bf16_ntile_major`, `Model.use_bf16_ntile_major`, `dispatchBF16` helper.
+- `bench/bench_forward_regions.zig`: `VLLM_BF16_NTILE_MAJOR` env gate.
+- `bench/bench_bf16_ntile_major.zig`: standalone microbench (1.29x single-thread proven).
+
+Gate via:
+```
+VLLM_BF16_NTILE_MAJOR=1 VLLM_POOLED_MLP=1 VLLM_POOLED_ATTN=1 \
+  VLLM_POOLED_MLP_FUSED=1 VLLM_QKV_FUSED=1 VLLM_N_THREADS=4 \
+  zig build bench-forward-regions -Doptimize=ReleaseFast
+```
+
 ## 0.0.10 — 2026-05-29
 
 **Lever-5: register-blocked BF16 matmul kernel (2.23x decode).**
