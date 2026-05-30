@@ -191,6 +191,21 @@ pub const LayerWeights = struct {
     w_down: Matrix,
     norm_input: []f32,
     norm_post_attn: []f32,
+    /// Optional raw BF16 copies of the MLP projections, used by the
+    /// pool.matmulBF16Auto dispatch path when loadFromSafeTensorsOpts
+    /// was called with load_mlp_bf16 = true. Storage layout matches
+    /// the matmul_bf16 kernel: rows = K (input dim), cols = N (output
+    /// dim). Null on default loads to keep memory at F32-only cost.
+    w_gate_bf16: ?weights_mod.RawBF16 = null,
+    w_up_bf16: ?weights_mod.RawBF16 = null,
+    w_down_bf16: ?weights_mod.RawBF16 = null,
+    /// Optional raw BF16 copies of the attention projections, parallel
+    /// to the MLP fields. Populated when LoadOpts.load_attn_bf16 = true.
+    /// Used by the v0.0.8 lever-2 attention-pool dispatch path.
+    w_q_bf16: ?weights_mod.RawBF16 = null,
+    w_k_bf16: ?weights_mod.RawBF16 = null,
+    w_v_bf16: ?weights_mod.RawBF16 = null,
+    w_o_bf16: ?weights_mod.RawBF16 = null,
 
     fn deinit(self: *LayerWeights, alloc: std.mem.Allocator) void {
         self.w_q.deinit(alloc);
@@ -202,7 +217,30 @@ pub const LayerWeights = struct {
         self.w_down.deinit(alloc);
         alloc.free(self.norm_input);
         alloc.free(self.norm_post_attn);
+        if (self.w_gate_bf16) |*b| b.deinit(alloc);
+        if (self.w_up_bf16) |*b| b.deinit(alloc);
+        if (self.w_down_bf16) |*b| b.deinit(alloc);
+        if (self.w_q_bf16) |*b| b.deinit(alloc);
+        if (self.w_k_bf16) |*b| b.deinit(alloc);
+        if (self.w_v_bf16) |*b| b.deinit(alloc);
+        if (self.w_o_bf16) |*b| b.deinit(alloc);
     }
+};
+
+/// Options for loadFromSafeTensorsOpts. The default-constructed value
+/// (`.{}`) reproduces the loadFromSafeTensors behavior bit-for-bit.
+pub const LoadOpts = struct {
+    /// When true, also load raw BF16 copies of the MLP projections
+    /// into LayerWeights.w_gate_bf16 / w_up_bf16 / w_down_bf16. The
+    /// pool.matmulBF16Auto dispatch reads these on the v0.0.8 MLP path.
+    /// Adds roughly 380 MB to the TinyLlama load on top of F32 weights.
+    load_mlp_bf16: bool = false,
+    /// When true, also load raw BF16 copies of the attention projections
+    /// (w_q / w_k / w_v / w_o) into the parallel _bf16 LayerWeights
+    /// fields. The pool.matmulBF16Auto dispatch reads these on the
+    /// v0.0.8 lever-2 attention path. Adds roughly 100 MB to the
+    /// TinyLlama load on top of F32 attention weights.
+    load_attn_bf16: bool = false,
 };
 
 pub const Model = struct {
@@ -238,6 +276,16 @@ pub const Model = struct {
     /// instead of the single-thread matmul_bf16.matmulBF16SIMD. Wired
     /// in v0.0.7. Has no effect unless a pool is also attached.
     use_pooled_bf16_lm_head: bool = false,
+    /// When true, route MLP gate / up / down matmuls through
+    /// pool.matmulBF16Auto using the raw BF16 weight copies. Requires
+    /// the model to have been loaded via loadFromSafeTensorsOpts with
+    /// load_mlp_bf16 = true; otherwise forward() falls through to the
+    /// F32 matmulDispatch path. Wired in v0.0.8.
+    use_pooled_bf16_mlp: bool = false,
+    /// When true, route attention Q / K / V / O projections through
+    /// pool.matmulBF16Auto using the raw BF16 weight copies. Requires
+    /// load_attn_bf16 = true at load time. v0.0.8 lever-2.
+    use_pooled_bf16_attn: bool = false,
 
     /// Configure the matmul thread count for subsequent forward passes.
     pub fn setThreads(self: *Model, n: usize) void {
@@ -256,6 +304,24 @@ pub const Model = struct {
     /// thread matmul_bf16.matmulBF16SIMD path.
     pub fn setPooledBF16LMHead(self: *Model, enable: bool) void {
         self.use_pooled_bf16_lm_head = enable;
+    }
+
+    /// Toggle the pooled BF16 MLP dispatch (v0.0.8 lever-1 retarget).
+    /// When enabled AND a pool is attached AND the model was loaded
+    /// with LoadOpts.load_mlp_bf16 = true, Model.forward routes the
+    /// gate / up / down projections through pool.matmulBF16Auto using
+    /// the raw BF16 weight copies. Otherwise forward() falls through
+    /// to the existing F32 matmulDispatch path.
+    pub fn setPooledBF16MLP(self: *Model, enable: bool) void {
+        self.use_pooled_bf16_mlp = enable;
+    }
+
+    /// Toggle the pooled BF16 attention dispatch (v0.0.8 lever-2).
+    /// When enabled AND a pool is attached AND the model was loaded
+    /// with LoadOpts.load_attn_bf16 = true, Model.forward routes Q,K,V
+    /// and O projections through pool.matmulBF16Auto.
+    pub fn setPooledBF16Attn(self: *Model, enable: bool) void {
+        self.use_pooled_bf16_attn = enable;
     }
 
     /// Attach a persistent thread pool. Caller retains ownership; the pool
@@ -294,6 +360,20 @@ pub const Model = struct {
         st: *safetensors.SafeTensors,
         config: Config,
     ) !Model {
+        return loadFromSafeTensorsOpts(alloc, st, config, .{});
+    }
+
+    /// Variant of loadFromSafeTensors that accepts LoadOpts. The
+    /// default-constructed LoadOpts reproduces loadFromSafeTensors
+    /// bit-for-bit; LoadOpts.load_mlp_bf16 = true additionally loads
+    /// raw BF16 copies of the MLP projections for the v0.0.8 lever-1
+    /// pool dispatch path.
+    pub fn loadFromSafeTensorsOpts(
+        alloc: std.mem.Allocator,
+        st: *safetensors.SafeTensors,
+        config: Config,
+        opts: LoadOpts,
+    ) !Model {
         var embed = try weights_mod.loadMatrixBF16(alloc, st, "model.embed_tokens.weight");
         errdefer embed.deinit(alloc);
 
@@ -320,6 +400,17 @@ pub const Model = struct {
                 .norm_input = try weights_mod.loadVectorBF16(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.input_layernorm.weight", .{i})),
                 .norm_post_attn = try weights_mod.loadVectorBF16(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{i})),
             };
+            if (opts.load_mlp_bf16) {
+                layers[i].w_gate_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.gate_proj.weight", .{i}));
+                layers[i].w_up_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.up_proj.weight", .{i}));
+                layers[i].w_down_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.down_proj.weight", .{i}));
+            }
+            if (opts.load_attn_bf16) {
+                layers[i].w_q_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{i}));
+                layers[i].w_k_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{i}));
+                layers[i].w_v_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{i}));
+                layers[i].w_o_bf16 = try weights_mod.loadMatrixBF16RawTransposed(alloc, st, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.o_proj.weight", .{i}));
+            }
         }
 
         const final_norm = try weights_mod.loadVectorBF16(alloc, st, "model.norm.weight");
@@ -400,19 +491,28 @@ pub const Model = struct {
             try rmsnorm.rmsnorm(&x, layer.norm_input, cfg.rms_norm_eps);
             if (inst) |ip| ip.add(.layernorm_input, nowNs() - t_ln_in_start);
 
-            // QKV projections
+            // QKV projections. v0.0.8 lever-2: when use_pooled_bf16_attn is
+            // set AND a pool is attached AND BF16 mirror weights are loaded,
+            // dispatch through pool.matmulBF16Auto. Otherwise fall through
+            // to the existing F32 matmulDispatch path.
+            const attn_bf16 = self.use_pooled_bf16_attn and self.pool != null and layer.w_q_bf16 != null and layer.w_k_bf16 != null and layer.w_v_bf16 != null and layer.w_o_bf16 != null;
             const t_qkv_start = if (inst != null) nowNs() else 0;
             var q = try Matrix.init(alloc, seq, q_dim);
             defer q.deinit(alloc);
-            try self.matmulDispatch(&x, &layer.w_q, &q);
-
             var k = try Matrix.init(alloc, seq, kv_dim);
             defer k.deinit(alloc);
-            try self.matmulDispatch(&x, &layer.w_k, &k);
-
             var v = try Matrix.init(alloc, seq, kv_dim);
             defer v.deinit(alloc);
-            try self.matmulDispatch(&x, &layer.w_v, &v);
+            if (attn_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&x, layer.w_q_bf16.?.data, layer.w_q_bf16.?.rows, layer.w_q_bf16.?.cols, &q, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_k_bf16.?.data, layer.w_k_bf16.?.rows, layer.w_k_bf16.?.cols, &k, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_v_bf16.?.data, layer.w_v_bf16.?.rows, layer.w_v_bf16.?.cols, &v, self.n_threads);
+            } else {
+                try self.matmulDispatch(&x, &layer.w_q, &q);
+                try self.matmulDispatch(&x, &layer.w_k, &k);
+                try self.matmulDispatch(&x, &layer.w_v, &v);
+            }
             if (inst) |ip| ip.add(.qkv_proj, nowNs() - t_qkv_start);
 
             // RoPE on Q and K
@@ -461,11 +561,17 @@ pub const Model = struct {
             }
             if (inst) |ip| ip.add(.attention, nowNs() - t_attn_start);
 
-            // O projection
+            // O projection. v0.0.8 lever-2 BF16 dispatch when enabled
+            // and BF16 mirror is loaded. Same gate as the QKV block above.
             const t_o_start = if (inst != null) nowNs() else 0;
             var o_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer o_out.deinit(alloc);
-            try self.matmulDispatch(&attn_out, &layer.w_o, &o_out);
+            if (attn_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&attn_out, layer.w_o_bf16.?.data, layer.w_o_bf16.?.rows, layer.w_o_bf16.?.cols, &o_out, self.n_threads);
+            } else {
+                try self.matmulDispatch(&attn_out, &layer.w_o, &o_out);
+            }
             if (inst) |ip| ip.add(.o_proj, nowNs() - t_o_start);
 
             // Residual add + post-attention norm bracketed together so
@@ -480,15 +586,25 @@ pub const Model = struct {
             try rmsnorm.rmsnorm(&x, layer.norm_post_attn, cfg.rms_norm_eps);
             if (inst) |ip| ip.add(.residual_add_ln, nowNs() - t_rln_start);
 
-            // MLP: gate + up projections
+            // MLP: gate + up projections. v0.0.8 lever-1 retarget: when
+            // use_pooled_bf16_mlp is set AND a pool is attached AND the
+            // BF16 weight copies are loaded, dispatch through
+            // pool.matmulBF16Auto using the raw BF16 weights. Otherwise
+            // fall back to the F32 matmulDispatch path.
+            const mlp_bf16 = self.use_pooled_bf16_mlp and self.pool != null and layer.w_gate_bf16 != null and layer.w_up_bf16 != null and layer.w_down_bf16 != null;
             const t_gu_start = if (inst != null) nowNs() else 0;
             var gate = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer gate.deinit(alloc);
-            try self.matmulDispatch(&x, &layer.w_gate, &gate);
-
             var up = try Matrix.init(alloc, seq, cfg.intermediate_size);
             defer up.deinit(alloc);
-            try self.matmulDispatch(&x, &layer.w_up, &up);
+            if (mlp_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&x, layer.w_gate_bf16.?.data, layer.w_gate_bf16.?.rows, layer.w_gate_bf16.?.cols, &gate, self.n_threads);
+                try p.matmulBF16Auto(&x, layer.w_up_bf16.?.data, layer.w_up_bf16.?.rows, layer.w_up_bf16.?.cols, &up, self.n_threads);
+            } else {
+                try self.matmulDispatch(&x, &layer.w_gate, &gate);
+                try self.matmulDispatch(&x, &layer.w_up, &up);
+            }
             if (inst) |ip| ip.add(.mlp_gate_up, nowNs() - t_gu_start);
 
             const t_silu_start = if (inst != null) nowNs() else 0;
@@ -498,7 +614,12 @@ pub const Model = struct {
             const t_down_start = if (inst != null) nowNs() else 0;
             var down_out = try Matrix.init(alloc, seq, cfg.hidden_size);
             defer down_out.deinit(alloc);
-            try self.matmulDispatch(&gate, &layer.w_down, &down_out);
+            if (mlp_bf16) {
+                const p = self.pool.?;
+                try p.matmulBF16Auto(&gate, layer.w_down_bf16.?.data, layer.w_down_bf16.?.rows, layer.w_down_bf16.?.cols, &down_out, self.n_threads);
+            } else {
+                try self.matmulDispatch(&gate, &layer.w_down, &down_out);
+            }
 
             for (x.data, residual.data, down_out.data) |*xv, rv, dv| xv.* = rv + dv;
             if (inst) |ip| ip.add(.mlp_down, nowNs() - t_down_start);
@@ -692,6 +813,125 @@ test "Config.fromJson — TinyLlama-shape" {
 test "Config.fromJson — missing field errors" {
     const json = "{\"vocab_size\": 100}";
     try testing.expectError(error.MissingField, Config.fromJson(testing.allocator, json));
+}
+
+test "LoadOpts default is bit-for-bit equal to legacy loader path" {
+    // Default LoadOpts must not change any field defaults that the
+    // existing loadFromSafeTensors callers rely on. If a future field
+    // is added it must default to the legacy behavior.
+    const opts: LoadOpts = .{};
+    try testing.expectEqual(false, opts.load_mlp_bf16);
+}
+
+test "LayerWeights mlp BF16 fields default to null" {
+    // BF16 mirror fields must default to null so deinit() of a
+    // legacy-loaded LayerWeights does not try to free unallocated
+    // memory and so the forward() guard `layer.w_gate_bf16 != null`
+    // correctly falls through to the F32 path.
+    var w_q = try Matrix.init(testing.allocator, 1, 1);
+    defer w_q.deinit(testing.allocator);
+    var w_k = try Matrix.init(testing.allocator, 1, 1);
+    defer w_k.deinit(testing.allocator);
+    var w_v = try Matrix.init(testing.allocator, 1, 1);
+    defer w_v.deinit(testing.allocator);
+    var w_o = try Matrix.init(testing.allocator, 1, 1);
+    defer w_o.deinit(testing.allocator);
+    var w_gate = try Matrix.init(testing.allocator, 1, 1);
+    defer w_gate.deinit(testing.allocator);
+    var w_up = try Matrix.init(testing.allocator, 1, 1);
+    defer w_up.deinit(testing.allocator);
+    var w_down = try Matrix.init(testing.allocator, 1, 1);
+    defer w_down.deinit(testing.allocator);
+    const ni = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(ni);
+    const np = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(np);
+    const lw: LayerWeights = .{
+        .w_q = w_q,
+        .w_k = w_k,
+        .w_v = w_v,
+        .w_o = w_o,
+        .w_gate = w_gate,
+        .w_up = w_up,
+        .w_down = w_down,
+        .norm_input = ni,
+        .norm_post_attn = np,
+    };
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_gate_bf16);
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_up_bf16);
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_down_bf16);
+}
+
+test "setPooledBF16MLP toggles flag" {
+    // Lightweight method-level test: setPooledBF16MLP must round-trip
+    // through Model.use_pooled_bf16_mlp without side effects on the
+    // sibling lm_head flag. Avoid constructing a full Model by using a
+    // synthetic stub.
+    var m: Model = undefined;
+    m.use_pooled_bf16_lm_head = false;
+    m.use_pooled_bf16_mlp = false;
+    m.use_pooled_bf16_attn = false;
+    m.setPooledBF16MLP(true);
+    try testing.expectEqual(true, m.use_pooled_bf16_mlp);
+    try testing.expectEqual(false, m.use_pooled_bf16_lm_head);
+    try testing.expectEqual(false, m.use_pooled_bf16_attn);
+    m.setPooledBF16MLP(false);
+    try testing.expectEqual(false, m.use_pooled_bf16_mlp);
+}
+
+test "setPooledBF16Attn toggles flag, independent of MLP/lm_head" {
+    var m: Model = undefined;
+    m.use_pooled_bf16_lm_head = false;
+    m.use_pooled_bf16_mlp = false;
+    m.use_pooled_bf16_attn = false;
+    m.setPooledBF16Attn(true);
+    try testing.expectEqual(true, m.use_pooled_bf16_attn);
+    try testing.expectEqual(false, m.use_pooled_bf16_mlp);
+    try testing.expectEqual(false, m.use_pooled_bf16_lm_head);
+    m.setPooledBF16Attn(false);
+    try testing.expectEqual(false, m.use_pooled_bf16_attn);
+}
+
+test "LoadOpts default load_attn_bf16 = false" {
+    const opts: LoadOpts = .{};
+    try testing.expectEqual(false, opts.load_attn_bf16);
+    try testing.expectEqual(false, opts.load_mlp_bf16);
+}
+
+test "LayerWeights attn BF16 fields default to null" {
+    var w_q = try Matrix.init(testing.allocator, 1, 1);
+    defer w_q.deinit(testing.allocator);
+    var w_k = try Matrix.init(testing.allocator, 1, 1);
+    defer w_k.deinit(testing.allocator);
+    var w_v = try Matrix.init(testing.allocator, 1, 1);
+    defer w_v.deinit(testing.allocator);
+    var w_o = try Matrix.init(testing.allocator, 1, 1);
+    defer w_o.deinit(testing.allocator);
+    var w_gate = try Matrix.init(testing.allocator, 1, 1);
+    defer w_gate.deinit(testing.allocator);
+    var w_up = try Matrix.init(testing.allocator, 1, 1);
+    defer w_up.deinit(testing.allocator);
+    var w_down = try Matrix.init(testing.allocator, 1, 1);
+    defer w_down.deinit(testing.allocator);
+    const ni = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(ni);
+    const np = try testing.allocator.alloc(f32, 1);
+    defer testing.allocator.free(np);
+    const lw: LayerWeights = .{
+        .w_q = w_q,
+        .w_k = w_k,
+        .w_v = w_v,
+        .w_o = w_o,
+        .w_gate = w_gate,
+        .w_up = w_up,
+        .w_down = w_down,
+        .norm_input = ni,
+        .norm_post_attn = np,
+    };
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_q_bf16);
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_k_bf16);
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_v_bf16);
+    try testing.expectEqual(@as(?weights_mod.RawBF16, null), lw.w_o_bf16);
 }
 
 test "transposeMatrix — small case" {

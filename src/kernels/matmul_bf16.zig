@@ -86,8 +86,10 @@ pub fn matmulBF16Scalar(
     }
 }
 
-/// Vectorised BF16-weights matmul. 8-lane @Vector(f32) accumulator;
-/// widens 8 u16 → 8 u32 → bitcast to 8 f32 per lane group.
+/// Vectorised BF16-weights matmul. 16-lane @Vector(f32) accumulator;
+/// widens 16 u16 -> 16 u32 -> bitcast to 16 f32 per lane group. On
+/// Ice Lake AVX-512 this compiles to VPMOVZXWD ZMM + VPSLLD + VFMADD.
+/// Bit-identical to the prior 8-lane variant on shapes divisible by 16.
 pub fn matmulBF16SIMD(
     a: *const Matrix,
     b: []const u16,
@@ -99,10 +101,10 @@ pub fn matmulBF16SIMD(
     if (c.rows != a.rows or c.cols != b_cols) return Error.DimensionMismatch;
     if (b.len != b_rows * b_cols) return Error.DimensionMismatch;
 
-    const Vec_u16 = @Vector(8, u16);
-    const Vec_u32 = @Vector(8, u32);
-    const Vec_f32 = @Vector(8, f32);
-    const LANE = 8;
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
 
     const M = a.rows;
     const N = b_cols;

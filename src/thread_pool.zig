@@ -413,8 +413,9 @@ fn matmulRowsKernel(a: *const Matrix, b: *const Matrix, c: *Matrix, row_start: u
         return;
     }
 
-    const Vec = @Vector(8, f32);
-    const LANE = 8;
+    // 16-lane: see kernels/matmul.zig matmulSIMDColRange docstring.
+    const Vec = @Vector(16, f32);
+    const LANE = 16;
     const n_tail = N - (N % LANE);
 
     var i = row_start;
@@ -444,8 +445,9 @@ fn matmulColRangeKernel(a: *const Matrix, b: *const Matrix, c: *Matrix, col_star
     const M = a.rows;
     const N = b.cols;
     const K = a.cols;
-    const Vec = @Vector(8, f32);
-    const LANE = 8;
+    // 16-lane: see kernels/matmul.zig matmulSIMDColRange docstring.
+    const Vec = @Vector(16, f32);
+    const LANE = 16;
 
     var i: usize = 0;
     while (i < M) : (i += 1) {
@@ -483,10 +485,11 @@ fn matmulBF16RowsKernel(
     row_end: usize,
 ) void {
     _ = b_rows;
-    const Vec_u16 = @Vector(8, u16);
-    const Vec_u32 = @Vector(8, u32);
-    const Vec_f32 = @Vector(8, f32);
-    const LANE = 8;
+    // 16-lane: see kernels/matmul.zig matmulSIMDColRange docstring.
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
 
     const N = b_cols;
     const K = a.cols;
@@ -535,10 +538,11 @@ fn matmulBF16ColRangeKernel(
     col_end: usize,
 ) void {
     _ = b_rows;
-    const Vec_u16 = @Vector(8, u16);
-    const Vec_u32 = @Vector(8, u32);
-    const Vec_f32 = @Vector(8, f32);
-    const LANE = 8;
+    // 16-lane: see kernels/matmul.zig matmulSIMDColRange docstring.
+    const Vec_u16 = @Vector(16, u16);
+    const Vec_u32 = @Vector(16, u32);
+    const Vec_f32 = @Vector(16, f32);
+    const LANE = 16;
 
     const M = a.rows;
     const N = b_cols;
