@@ -1,5 +1,121 @@
 # Changelog
 
+## 0.0.10 — 2026-05-29
+
+**Lever-5: register-blocked BF16 matmul kernel (2.23x decode).**
+
+Replaces the pool's BF16 column-range kernel and adds standalone
+`matmulBF16SIMDRegBlock`. Switches from outer-product (K outer, N inner
+over c) to inner-product (N outer in 64-column tiles, K inner with 4
+ZMM accumulators held live across the full K loop).
+
+Memory traffic on M=1 K=2048 N=2048:
+- outer-product: K*N c-reads + K*N c-writes (4M ops to c)
+- inner-product: N c-stores per tile (32 stores total)
+
+The K-fold reduction in c-traffic was the dominant cost in the old
+SIMD path. Accumulators stay in @Vector(16, f32) ZMMs via `@mulAdd`
+(FMA, one rounding) rather than separate mul+add (two roundings).
+
+End-to-end on TinyLlama-1.1B-Chat (n_threads=4, lever-1..4 stacked,
+ReleaseFast):
+
+```
+  metric         | lever-4 (load 22) | lever-5 (load 18) | speedup
+  ---------------+-------------------+-------------------+--------
+  decode med     |        617        |        277        |  2.23x
+  decode p10     |        473        |        263        |  1.80x
+  decode p90     |        660        |        311        |  2.12x
+```
+
+Per-region (decode + prefill, 5 rounds, med ms):
+
+```
+  region        | lever-4 | lever-5 | speedup
+  --------------+---------+---------+--------
+  mlp_gate_up   |   4709  |   2361  |  1.99x
+  mlp_down      |   3435  |   1261  |  2.72x
+  qkv_proj      |   1740  |    558  |  3.12x
+  o_proj        |   1417  |    474  |  2.99x
+  lm_head       |    518  |    295  |  1.76x
+```
+
+Numerical equivalence within 6.7e-6 max_abs on the M=1 K=2048 N=32000
+lm_head shape; relative diff bounded by FMA-vs-separate-rounding gap
+at K=2048 accumulation.
+
+89/89 tests pass. exp-1780108119-609312875 confirmed.
+
+**Honest refuted attempts (Type-I prevention):**
+
+- Lever-6 (manual `@prefetch` in K loop) — 2x regression across all
+  BF16 matmul regions. Manual prefetch with locality=3 fights Ice
+  Lake's L2 hardware streamer and thrashes L1 across 4 worker threads.
+  exp-1780108992-833810307.
+- Lever-7 (`VLLM_POOLED_LM_HEAD=1` re-test post lever-5) — lm_head
+  region itself improved 3.7pct but other regions regressed 17-24pct.
+  Net inconclusive at variance level; lm_head pool stays off.
+  exp-1780109335-555121691.
+- Lever-7 alt (`VLLM_N_THREADS=8` re-test) — refuted; +1.8pct worse
+  decode median, futex sync overhead per dispatch dominates. n=4
+  remains optimal. exp-1780109647-402094155.
+- Lever-8 (N_TILE=128, 8 ZMM accumulators) — refuted; +25pct worse
+  p90 and +10pct mlp_gate_up. Ice Lake L1 read-port bandwidth, not
+  ZMM count, is the local limit. exp-1780109796-369194807.
+
+## 0.0.9 — 2026-05-29
+
+**Lever-4: QKV matmul fusion (3 attention dispatches → 1).**
+
+Adds `LayerWeights.w_qkv_bf16` fused Q|K|V weight matrix and
+`LoadOpts.fuse_qkv` flag. Forward path constructs non-owning Matrix
+views q/k/v over the single fused `qkv_buf` so RoPE and attention
+consume them unchanged.
+
+`loadMatrixBF16RawConcat3Transposed` concatenates Q|K|V on load;
+`bench_forward_regions` adds `VLLM_QKV_FUSED` env gate.
+
+Architectural reduction: 3 attention-region pool dispatches → 1.
+
+Perf delta filed inconclusive (exp-1780107082-417603501) — bench ran
+at load avg 22-28 with within-run 1.9x variance (R1 900 vs R5 473
+ms/tok); clean-load A/B-toggle harness needed for fair delta.
+
+87/87 tests pass.
+
+## 0.0.8 — 2026-05-29
+
+**Lever-2 + Lever-3: pooled attention + gate+up matmul fusion.**
+
+Lever-2: `w_qkv_bf16`, `w_o_bf16` BF16 weight storage with pool dispatch
+through `matmulBF16Auto`. Attention regions (qkv_proj, o_proj) now route
+through the persistent thread pool.
+
+Lever-3: `LoadOpts.fuse_mlp_gate_up` flag concatenates gate + up weights
+into single `w_gateup_bf16` matrix. Halves MLP dispatches per layer
+(3 → 2 BF16 matmuls). p10 194 ms/tok crosses 200 ms/tok decode target
+on clean machine.
+
+86/86 tests pass (v0.0.8). lm_head BF16 pool dispatch documented as
+Type-I catch — wash at M=1 K=2048 N=32000 because per-thread per-tile
+work is so small that futex sync overhead cancels parallel gain.
+
+## 0.0.7 — 2026-05-29
+
+**Per-region instrumentation + lever-1 retarget.**
+
+`bench/bench_forward_regions.zig`: end-to-end Model.forward with
+nanosecond per-region timers (embed, layernorm, qkv_proj, rope,
+attention, o_proj, residual_add_ln, mlp_gate_up, silu_mul, mlp_down,
+final_norm, lm_head). VLLM_INSTRUMENT=1 to enable.
+
+Instrumentation revealed MLP regions account for 75pct of decode TAM
+(mlp_gate_up 45pct, mlp_down 30pct). Lever-1 retargets from attention
+(which was 20pct combined) to MLP. v0.0.7 ships the pooled BF16 MLP
+dispatch path; v0.0.8 adds the gate+up fusion.
+
+83/83 tests pass.
+
 ## 0.0.6 — 2026-05-27
 
 **Repair pass: restore test+bench wiring; wire BF16 lm_head into forward.**
