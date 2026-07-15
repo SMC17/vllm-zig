@@ -108,24 +108,6 @@ pub fn build(b: *std.Build) void {
     bench_tiled_step.dependOn(&run_bench_tiled.step);
 
     // ------------------------------------------------------------------
-    // forward-skeleton — transformer-block smoke test
-    // ------------------------------------------------------------------
-    const ex_mod = b.createModule(.{
-        .root_source_file = b.path("examples/forward_skeleton.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ex_mod.addImport("vllm", mod);
-    const ex_exe = b.addExecutable(.{
-        .name = "forward-skeleton",
-        .root_module = ex_mod,
-    });
-    b.installArtifact(ex_exe);
-    const run_ex = b.addRunArtifact(ex_exe);
-    const ex_step = b.step("forward-skeleton", "Run the transformer-block skeleton smoke test");
-    ex_step.dependOn(&run_ex.step);
-
-    // ------------------------------------------------------------------
     // infer-tinyllama — end-to-end inference smoke test
     // ------------------------------------------------------------------
     const infer_mod = b.createModule(.{
