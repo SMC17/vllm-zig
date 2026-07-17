@@ -9,15 +9,16 @@ parity with Berkeley vLLM / SGLang. STATUS uses explicit non-claims — keep the
 
 1. Read `README.md` and `STATUS.md` (Type-I notes on benches matter).
 2. Run the proof gate before claiming tests green.
-3. Path dependencies today:
+3. Dependencies live under `deps/` (gitignored checkouts or symlinks):
 
 ```text
-safetensors-zig  -> ../safetensors-zig
-tokenizers-zig   -> ../tokenizers-zig
+deps/safetensors-zig  -> path dep (clone or symlink)
+deps/tokenizers-zig   -> path dep (clone or symlink)
 ```
 
-Clean-clone CI / public release requires converting these to `url` + `hash`
-(or vendoring). Do not pretend path deps are portable.
+Bootstrap: `./scripts/fetch-deps.sh` (uses `gh` or sibling symlinks).
+CI checks private siblings into `deps/` via multi-checkout (see `.github/workflows/ci.yml`).
+Private GitHub archive `url`+`hash` is not used: unauthenticated fetch 404s.
 
 ## Proof gate
 

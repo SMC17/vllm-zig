@@ -1,0 +1,17 @@
+# Consumer of SMC17/stax-hygiene reusable Zig test.
+# Note: primary CI checks out private deps; this reusable job only has
+# the vllm tree — skip until deps are vendored into a single checkout.
+# Use workflow_dispatch / primary CI for proof. Keep file for inheritance
+# score once multi-repo reusable inputs land.
+name: Hygiene Zig (reusable)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  zig-test:
+    uses: SMC17/stax-hygiene/.github/workflows/reusable-zig-test.yml@main
+    with:
+      zig-version: '0.16.0'
+      test-args: '--summary all'
+      skip-fmt: true

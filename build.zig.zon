@@ -15,13 +15,15 @@
         "CHANGELOG.md",
         "ARCHITECTURE.md",
         "LICENSE",
+        "AGENTS.md",
+        "scripts",
     },
     .dependencies = .{
         .safetensors = .{
-            .path = "../safetensors-zig",
+            .path = "deps/safetensors-zig",
         },
         .tokenizers = .{
-            .path = "../tokenizers-zig",
+            .path = "deps/tokenizers-zig",
         },
     },
 }
