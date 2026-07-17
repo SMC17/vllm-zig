@@ -7,3 +7,4 @@ zig-out/
 # Local/CI dependency checkouts (see scripts/fetch-deps.sh)
 deps/*
 !deps/.gitkeep
+zig-pkg/
