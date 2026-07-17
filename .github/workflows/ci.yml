@@ -1,6 +1,8 @@
-# Clean-clone CI: sibling private deps checked out into deps/ (not ../).
-# Requires Actions access to SMC17/safetensors-zig and SMC17/tokenizers-zig
-# (same owner private repos + GITHUB_TOKEN is enough with default permissions).
+# Clean-clone CI: sibling private deps checked out into deps/.
+#
+# Default GITHUB_TOKEN cannot read other private repos. Set repository secret
+# CROSS_REPO_PAT (classic PAT or fine-grained with contents:read on
+# safetensors-zig + tokenizers-zig) for multi-checkout to work.
 name: CI
 
 on:
@@ -25,6 +27,7 @@ jobs:
           repository: SMC17/safetensors-zig
           path: deps/safetensors-zig
           fetch-depth: 1
+          token: ${{ secrets.CROSS_REPO_PAT || github.token }}
 
       - name: Checkout tokenizers-zig into deps/
         uses: actions/checkout@v4
@@ -32,6 +35,7 @@ jobs:
           repository: SMC17/tokenizers-zig
           path: deps/tokenizers-zig
           fetch-depth: 1
+          token: ${{ secrets.CROSS_REPO_PAT || github.token }}
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -41,6 +45,4 @@ jobs:
         run: zig version
 
       - name: zig build test
-        # Integration example examples/infer_tinyllama.zig needs a large
-        # safetensors fixture and is NOT exercised here.
         run: zig build test --summary all
