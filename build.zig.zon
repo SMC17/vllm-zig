@@ -19,9 +19,11 @@
         "scripts",
     },
     .dependencies = .{
+        // Upstream: https://github.com/SMC17/safetensors-zig
         .safetensors = .{
             .path = "deps/safetensors-zig",
         },
+        // Upstream: https://github.com/SMC17/tokenizers-zig
         .tokenizers = .{
             .path = "deps/tokenizers-zig",
         },
