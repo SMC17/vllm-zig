@@ -1,8 +1,5 @@
-# Clean-clone CI: sibling private deps checked out into deps/.
-#
-# Default GITHUB_TOKEN cannot read other private repos. Set repository secret
-# CROSS_REPO_PAT (classic PAT or fine-grained with contents:read on
-# safetensors-zig + tokenizers-zig) for multi-checkout to work.
+# Clean-clone CI: dependencies are fetched by `zig build` from the
+# url+hash pins in build.zig.zon.
 name: CI
 
 on:
@@ -20,22 +17,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: Checkout safetensors-zig into deps/
-        uses: actions/checkout@v4
-        with:
-          repository: SMC17/safetensors-zig
-          path: deps/safetensors-zig
-          fetch-depth: 1
-          token: ${{ secrets.CROSS_REPO_PAT || github.token }}
-
-      - name: Checkout tokenizers-zig into deps/
-        uses: actions/checkout@v4
-        with:
-          repository: SMC17/tokenizers-zig
-          path: deps/tokenizers-zig
-          fetch-depth: 1
-          token: ${{ secrets.CROSS_REPO_PAT || github.token }}
 
       - uses: mlugg/setup-zig@v2
         with:

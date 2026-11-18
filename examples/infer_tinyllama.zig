@@ -81,7 +81,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("prompt tokens: {d}\n", .{ids_with_bos.len});
 
     // --- KV cache ---
-    var kv = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.max_position_embeddings, cfg.num_key_value_heads, cfg.head_dim);
+    // Paged KV: enough blocks for max_position_embeddings tokens in every layer.
+    const BLOCK_SIZE = vllm.page_manager.PageManager.BLOCK_SIZE;
+    const kv_blocks = cfg.num_hidden_layers * ((cfg.max_position_embeddings + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    var pm = try vllm.page_manager.PageManager.init(alloc, kv_blocks, cfg.num_key_value_heads, cfg.head_dim);
+    defer pm.deinit();
+    var ba = try vllm.paged_attention.BlockAllocator.init(alloc, kv_blocks);
+    defer ba.deinit();
+    var kv = try vllm.kv_cache.KVCache.init(alloc, cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, &pm, &ba);
     defer kv.deinit();
 
     // --- Generate ---
