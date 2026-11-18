@@ -3,8 +3,4 @@ zig-out/
 *.log
 .DS_Store
 
-
-# Local/CI dependency checkouts (see scripts/fetch-deps.sh)
-deps/*
-!deps/.gitkeep
 zig-pkg/

@@ -5,7 +5,7 @@
 [![CI](https://github.com/SMC17/vllm-zig/actions/workflows/ci.yml/badge.svg)](https://github.com/SMC17/vllm-zig/actions)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 [![Zig: 0.16](https://img.shields.io/badge/Zig-0.16-orange.svg)](https://ziglang.org/)
-[![Tests: 77/77](https://img.shields.io/badge/tests-77%2F77-success.svg)](#tests)
+[![Tests: 82 pass, 9 skip](https://img.shields.io/badge/tests-82%20pass%2C%209%20skip-success.svg)](#tests)
 
 ## What ships (v0.0.6)
 
@@ -16,8 +16,8 @@
 - PagedAttention KV substrate (`page_manager.zig` + `paged_attention.zig`):
   K and V planes split, 64-byte-aligned, per-block per-head views
 - Streaming `generate()` — each decoded token emitted via caller callback
-- Parallel BF16→F32 weight load (safetensors-zig as a path dependency)
-- 77/77 unit tests pass; SIMD ↔ scalar matmul agreement across 7
+- Parallel BF16→F32 weight load (safetensors-zig as a pinned `url`+`hash` dependency)
+- 82/91 unit tests pass, 9 skipped off Linux; SIMD ↔ scalar matmul agreement across 7
   `(M, K, N)` shape variants
 
 ## What does NOT ship yet
@@ -31,7 +31,7 @@
 ## Quickstart
 
 ```sh
-zig build test                  # 77 unit tests
+zig build test                  # 91 unit tests
 zig build forward-skeleton      # Wiring smoke test
 zig build bench-matmul          # Matmul scalar vs SIMD speedup table
 zig build bench-pool            # Persistent pool vs ad-hoc spawn
@@ -168,7 +168,9 @@ cost dominating at M=1) was closed by the persistent worker pool at v0.0.5.
 
 ## Tests
 
-77/77 unit tests pass at v0.0.6 (`zig build test`). SIMD ↔ scalar
+`zig build test --summary all` on Zig 0.16.0, macOS arm64: 82/91 pass,
+9 skipped (the `thread_pool.zig` tests need Linux futex and skip on
+other OSes). Measured from a fresh clone on 2026-11-17. SIMD ↔ scalar
 matmul agreement verified across 7 `(M, K, N)` shape variants. The
 `forward-skeleton`, `infer-tinyllama`, and `bench-tinyllama-pool`
 steps exercise the full pipeline end-to-end against real weights.

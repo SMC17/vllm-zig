@@ -21,11 +21,13 @@
     .dependencies = .{
         // Upstream: https://github.com/SMC17/safetensors-zig
         .safetensors = .{
-            .path = "deps/safetensors-zig",
+            .url = "https://github.com/SMC17/safetensors-zig/archive/17328a3f984ab2b657396302f438a572e8a05be9.tar.gz",
+            .hash = "safetensors_zig-0.3.0-jWdPYkEIHgDRmmzZ7WK3QsUDZ9AhbWm7yhY1hQg8mscU",
         },
         // Upstream: https://github.com/SMC17/tokenizers-zig
         .tokenizers = .{
-            .path = "deps/tokenizers-zig",
+            .url = "https://github.com/SMC17/tokenizers-zig/archive/558bfbcaf29319aacf6641ce81c901e571f14a15.tar.gz",
+            .hash = "tokenizers_zig-0.26.0-bcGp7yR1BwBZpxEKAKwwLkm1r56lGZOBuCieYOvfYUZ8",
         },
     },
 }
