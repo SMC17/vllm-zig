@@ -1,5 +1,7 @@
 # vllm-zig
 
+**[Status](STATUS.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/SMC17/vllm-zig/issues) · [Public roadmap](https://github.com/users/SMC17/projects/16)**
+
 > Pure-Zig LLM serving substrate — paged attention, BF16 kernels, persistent thread-pool dispatch.
 
 [![CI](https://github.com/SMC17/vllm-zig/actions/workflows/ci.yml/badge.svg)](https://github.com/SMC17/vllm-zig/actions)
